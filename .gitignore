@@ -1,0 +1,16 @@
+# Interview prep (private)
+INTERVIEW_PREP.md
+
+# Environment
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
