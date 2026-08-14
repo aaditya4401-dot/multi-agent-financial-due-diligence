@@ -1,11 +1,18 @@
 import logging
 from datetime import datetime
 
+from src.claims.confidence import aggregate_confidence
+from src.claims.models import Claim
 from src.llm import Tier, get_llm
 from src.models.schemas import DueDiligenceReport, inconclusive_report
 from src.state import AgentFindings, Conflict, DueDiligenceState
 
 logger = logging.getLogger(__name__)
+
+#: Claims per section handed to the synthesizer, best evidence first. The old
+#: prompt inlined every raw finding twice over; a ranked digest of typed claims
+#: says more in a fraction of the context.
+MAX_CLAIMS_PER_SECTION = 15
 
 SYSTEM_PROMPT = (
     "You are a senior investment analyst writing a due diligence report. "
@@ -72,11 +79,53 @@ def failed_agents(state: DueDiligenceState) -> list[str]:
     return failed
 
 
-def _build_user_prompt(state: DueDiligenceState) -> str:
-    parts = [
-        f"=== {label} FINDINGS ===\n{_format_findings(state.get(key))}"
-        for label, key in SECTIONS
+def claims_by_agent(state: DueDiligenceState) -> dict[str, list[Claim]]:
+    """Group scored claims by the agent that produced them, best evidence first."""
+    grouped: dict[str, list[Claim]] = {}
+    for claim in state.get("claims") or []:
+        grouped.setdefault(claim.extracted_by, []).append(claim)
+    for claims in grouped.values():
+        claims.sort(key=lambda c: c.confidence, reverse=True)
+    return grouped
+
+
+def section_confidences(state: DueDiligenceState) -> dict[str, float]:
+    """Confidence per section, derived from its claims rather than guessed."""
+    return {
+        agent: aggregate_confidence(claims)
+        for agent, claims in claims_by_agent(state).items()
+    }
+
+
+def _format_claims(claims: list[Claim]) -> str:
+    lines = [
+        f"  {i}. {c.describe()}\n     {c.assertion[:250]}"
+        for i, c in enumerate(claims[:MAX_CLAIMS_PER_SECTION], 1)
     ]
+    if len(claims) > MAX_CLAIMS_PER_SECTION:
+        lines.append(f"  … and {len(claims) - MAX_CLAIMS_PER_SECTION} lower-confidence claim(s)")
+    return "\n".join(lines)
+
+
+def _build_user_prompt(state: DueDiligenceState) -> str:
+    grouped = claims_by_agent(state)
+
+    parts = []
+    for label, key in SECTIONS:
+        findings = state.get(key)
+        agent = label.lower()
+
+        if not findings or not findings.get("ok", True):
+            parts.append(f"=== {label} ===\n{_format_findings(findings)}")
+        elif grouped.get(agent):
+            parts.append(
+                f"=== {label} CLAIMS "
+                f"(confidence {aggregate_confidence(grouped[agent]):.0%}) ===\n"
+                f"{_format_claims(grouped[agent])}"
+            )
+        else:
+            # No claims extracted — fall back to the raw findings.
+            parts.append(f"=== {label} FINDINGS ===\n{_format_findings(findings)}")
     parts.append(f"=== CONFLICTS DETECTED ===\n{_format_conflicts(state.get('conflicts', []))}")
 
     today = datetime.now().strftime("%Y-%m-%d")
@@ -93,6 +142,41 @@ def _build_user_prompt(state: DueDiligenceState) -> str:
         + note
         + "\n\nSynthesize everything into a structured investment memo."
     )
+
+
+def _apply_computed_confidence(
+    report: DueDiligenceReport,
+    state: DueDiligenceState,
+    unavailable: list[str],
+) -> None:
+    """Replace the model's guessed confidences with values derived from evidence.
+
+    Section confidence is the aggregate of that section's scored claims, and
+    overall confidence is the mean across available sections. A model asked to
+    rate its own certainty will produce a plausible number; this produces a
+    traceable one.
+    """
+    computed = section_confidences(state)
+    if not computed:
+        return
+
+    available: list[float] = []
+    for agent in ("financial", "market", "risk", "sentiment"):
+        section = getattr(report, f"{agent}_section", None)
+        if section is None:
+            continue
+
+        if agent in unavailable:
+            section.available = False
+            section.section_confidence = 0.0
+            continue
+
+        if agent in computed:
+            section.section_confidence = computed[agent]
+            available.append(computed[agent])
+
+    if available:
+        report.overall_confidence = round(sum(available) / len(available), 4)
 
 
 # ---------------------------------------------------------------------------
@@ -119,8 +203,9 @@ async def synthesizer_node(state: DueDiligenceState) -> dict:
             {"role": "user", "content": _build_user_prompt(state)},
         ])
 
-        # Trust our own failure tracking over the model's self-report.
+        # Trust our own bookkeeping over the model's self-report.
         result.unavailable_sections = unavailable
+        _apply_computed_confidence(result, state, unavailable)
         report = result
 
     except Exception as exc:

@@ -6,7 +6,7 @@ from typing import Any
 
 from langgraph.graph import END, StateGraph
 
-from src.agents.conflict_resolver import conflict_resolver_node
+from src.agents.evidence import evidence_node
 from src.agents.financial import financial_agent
 from src.agents.market import market_agent
 from src.agents.risk import risk_agent
@@ -51,7 +51,7 @@ def build_workflow() -> StateGraph:
     workflow.add_node("market", market_agent)
     workflow.add_node("risk", risk_agent)
     workflow.add_node("sentiment", sentiment_agent)
-    workflow.add_node("conflict_resolver", conflict_resolver_node)
+    workflow.add_node("evidence", evidence_node)
     workflow.add_node("synthesizer", synthesizer_node)
 
     workflow.set_entry_point("orchestrator")
@@ -60,11 +60,11 @@ def build_workflow() -> StateGraph:
     for agent in ("financial", "market", "risk", "sentiment"):
         workflow.add_edge("orchestrator", agent)
 
-    # Fan-in: all 4 agents → conflict resolver
-    workflow.add_edge(["financial", "market", "risk", "sentiment"], "conflict_resolver")
+    # Fan-in: all 4 agents → evidence graph (extract, detect, score)
+    workflow.add_edge(["financial", "market", "risk", "sentiment"], "evidence")
 
-    # Linear: resolver → synthesizer → END
-    workflow.add_edge("conflict_resolver", "synthesizer")
+    # Linear: evidence → synthesizer → END
+    workflow.add_edge("evidence", "synthesizer")
     workflow.add_edge("synthesizer", END)
 
     return workflow

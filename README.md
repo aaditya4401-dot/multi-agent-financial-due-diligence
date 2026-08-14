@@ -131,9 +131,9 @@ User Input: "Analyze Stripe"
      │   │   │   │        ← Fan-in (merge results)
      ▼   ▼   ▼   ▼
 ┌─────────────────────┐
-│  Conflict Resolver  │  ← Detects contradictions
-│  (classify + score) │     between agent findings
-└──────────┬──────────┘
+│      Evidence       │  ← Extracts typed claims, then
+│ extract→detect→score│     detects contradictions by
+└──────────┬──────────┘     groupby — no LLM guesswork
            ▼
 ┌─────────────────────┐
 │   Synthesizer       │  ← Produces structured
@@ -141,7 +141,7 @@ User Input: "Analyze Stripe"
 └──────────┬──────────┘
            ▼
    Due Diligence Report
-   (with confidence scores)
+   (with derived confidence)
 ```
 
 ### How the graph is wired
@@ -177,17 +177,76 @@ Key implications:
 - Agents can **disagree** (different data sources → different conclusions)
 - You need an **orchestrator** to coordinate them and a **resolver** to handle disagreements
 
+### The claim graph
+
+Agent findings are not passed around as prose. The `evidence` node converts
+them into typed **claims**, and everything downstream reasons over those.
+
+A claim is either **quantitative** — a number pinned to
+`(subject, predicate, period, unit)` — or **qualitative**, a sourced assertion
+with no number. The split matters: you can subtract two numbers, you cannot
+subtract two sentences, and pretending otherwise is what made prose-based
+conflict detection unreliable.
+
+The predicate vocabulary is what makes it work. "TPV", "payment volume" and
+"total payments processed" all resolve to one predicate, and `$1.9T`,
+`1.9 trillion` and `1,900,000,000,000` all parse to the same float — so two
+agents disagreeing becomes a `groupby`, not a judgement call.
+
+```
+agent findings
+   → extract   (FAST tier; LLM maps semantics, Python does all arithmetic)
+   → detect    (pure Python — no LLM, cannot hallucinate)
+   → score     (pure Python — confidence propagation)
+   → tensions  (REASONING tier; qualitative claims only)
+```
+
 ### Conflict Resolution
 
-When agents disagree, the resolver classifies conflicts into 3 types:
+| Type | Example | How it's found |
+|------|---------|----------------|
+| **Factual contradiction** | Agent A: TPV $1.9T, Agent B: $1.4T | Deterministic — same `(subject, predicate, period)`, values beyond the predicate's tolerance |
+| **Stale data** | 2023 valuation vs 2026 valuation | Deterministic — divergence across a gap longer than the predicate's half-life |
+| **Complementary tension** | Financial: growing fast, Risk: burning cash | LLM — genuinely qualitative, no arithmetic can settle it |
 
-| Type | Example | Resolution |
-|------|---------|------------|
-| **Factual contradiction** | Agent A: revenue $20B, Agent B: revenue $14B | Pick the one with better source quality |
-| **Complementary tension** | Financial: growing fast, Risk: burning cash | Both are true — surface the nuance |
-| **Stale data** | Agent A: 2024 data, Agent B: 2026 data | Prefer the more recent source |
+Only the third needs a model, and it sees only qualitative claims ranked by
+confidence rather than every finding from every agent.
 
-The resolver is a single structured-output LLM call (not a react agent) that classifies conflicts and assigns confidence scores.
+Adjudication is deterministic too: better source tier wins, ties break on
+recency, and for stale-data conflicts recency leads instead. Sources that
+*agree* with the winner are not demoted alongside the one that disagreed.
+
+### Confidence
+
+Confidence used to be a constant at the call site — `0.85` for anything
+yfinance returned, `0.5` for anything from the web — and overall confidence was
+invented by the LLM. It is now derived:
+
+```
+confidence = prior x recency x corroboration x contradiction_penalty
+```
+
+- **prior** — source tier (SEC filing 0.95 → forum 0.35), inferred from domain
+- **recency** — exponential decay on the predicate's half-life (market cap
+  30 days, TAM 365), floored so old evidence is discounted, not deleted
+- **corroboration** — noisy-OR across *independent registrable domains*,
+  discounted and capped, so syndicated copies of one wire story count once and
+  a pile of forum posts cannot outweigh a primary filing
+- **contradiction** — conflicting claims split confidence in proportion to
+  their standing, so the loser is visibly demoted
+
+Section confidence is the aggregate of that section's claims, and overall
+confidence is the mean across available sections. Both **overwrite** whatever
+the model guessed.
+
+### Guarding against bad extraction
+
+Every predicate carries a plausible magnitude range. A model asked for "the
+valuation" will occasionally return a share price or a stray number from the
+same sentence — a live run produced `valuation = $49` and `payment_volume = 40`.
+Such values are demoted to qualitative claims: the text survives, the false
+precision does not, and it can never manufacture a contradiction or skew a
+confidence score.
 
 ### Graceful Degradation — without smoothing over failures
 
@@ -259,8 +318,16 @@ multi-agent-due-diligence/
 │   │   ├── market.py             # Market research agent (Tavily)
 │   │   ├── risk.py               # Risk assessment agent (SEC + Tavily)
 │   │   ├── sentiment.py          # Sentiment analysis agent (news + Reddit + Tavily)
-│   │   ├── conflict_resolver.py  # Conflict detection & classification (structured output)
+│   │   ├── evidence.py           # extract → detect → score → conflicts
+│   │   ├── conflict_resolver.py  # Qualitative tension detection (the LLM's share)
 │   │   └── synthesizer.py        # Final report generation (structured output)
+│   ├── claims/
+│   │   ├── __init__.py
+│   │   ├── models.py             # Claim, SourceTier, domain-based tiering
+│   │   ├── ontology.py           # Predicates, aliases, units, half-lives, bounds
+│   │   ├── extract.py            # Findings → typed claims (FAST tier)
+│   │   ├── contradictions.py     # Deterministic detection + adjudication
+│   │   └── confidence.py         # Confidence propagation
 │   ├── tools/
 │   │   ├── __init__.py
 │   │   ├── search_tools.py       # Tavily client pool + TTL cache + request coalescing
@@ -273,7 +340,8 @@ multi-agent-due-diligence/
 └── tests/
     ├── __init__.py
     ├── test_tools.py             # Smoke tests for all tool modules
-    └── test_pipeline.py          # Caching, failure semantics, graph wiring (offline)
+    ├── test_pipeline.py          # Caching, failure semantics, graph wiring (offline)
+    └── test_claims.py            # Normalization, detection, confidence (offline)
 ```
 
 The four research agents are configuration only — prompt, tools, and target

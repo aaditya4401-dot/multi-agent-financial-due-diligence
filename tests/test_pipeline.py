@@ -4,16 +4,46 @@ All offline — no API keys and no network required.
 """
 
 import asyncio
+from datetime import date
 
 import pytest
 
 import src.tools.search_tools as st
-from src.agents.conflict_resolver import conflict_resolver_node
-from src.agents.synthesizer import failed_agents, synthesizer_node
+from src.claims.confidence import score_claims
+from src.claims.models import Claim, SourceTier
+from src.claims.ontology import Predicate, Unit
+from src.agents.conflict_resolver import detect_tensions
+from src.agents.evidence import evidence_node
+from src.agents.synthesizer import (
+    failed_agents,
+    section_confidences,
+    synthesizer_node,
+)
 from src.agents.utils import error_findings, parse_react_output
 from src.graph import app
 from src.models.schemas import DueDiligenceReport, inconclusive_report
 from src.state import AgentFindings, Finding
+
+
+def _quant_claim(
+    value: float,
+    agent: str,
+    url: str,
+    tier: SourceTier = SourceTier.NEWS,
+    predicate: Predicate = Predicate.PAYMENT_VOLUME,
+) -> Claim:
+    return Claim(
+        subject="testco",
+        assertion=f"{predicate.value} was {value}",
+        source_url=url,
+        source_tier=tier,
+        observed_at=date.today(),
+        extracted_by=agent,
+        predicate=predicate,
+        period="FY2025",
+        value=value,
+        unit=Unit.USD,
+    )
 
 
 def _findings(name: str, n: int = 1, ok: bool = True) -> AgentFindings:
@@ -153,45 +183,101 @@ class TestFailureSemantics:
 # Conflict resolver
 # ---------------------------------------------------------------------------
 
-class TestConflictResolver:
-    def test_skips_llm_with_fewer_than_two_sources(self):
+class TestEvidenceNode:
+    """No API key is set, so any LLM call would raise. These prove the
+    deterministic paths run without one."""
+
+    def test_no_findings_yields_no_claims_or_conflicts(self):
         state = {
             "company": "TestCo",
-            "financial_findings": _findings("financial"),
-            "market_findings": _findings("market", ok=False),
-            "risk_findings": None,
-            "sentiment_findings": _findings("sentiment", n=0),
+            **{f"{a}_findings": _findings(a, ok=False)
+               for a in ("financial", "market", "risk", "sentiment")},
         }
-        assert asyncio.run(conflict_resolver_node(state)) == {"conflicts": []}
+        assert asyncio.run(evidence_node(state)) == {"claims": [], "conflicts": []}
 
-    def test_failed_agents_excluded_from_comparison(self):
-        from src.agents.conflict_resolver import _usable_sections
+    def test_tension_detection_skipped_below_two_claims(self):
+        assert asyncio.run(detect_tensions("testco", [])) == []
 
-        state = {
-            "financial_findings": _findings("financial"),
-            "market_findings": _findings("market", ok=False),
-            "risk_findings": _findings("risk"),
-            "sentiment_findings": _findings("sentiment", n=0),
-        }
-        labels = [label for label, _ in _usable_sections(state)]
-        assert labels == ["FINANCIAL", "RISK"]
+    def test_tension_detection_skipped_for_single_agent(self):
+        """Tension is interesting between perspectives, not within one."""
+        claims = [
+            Claim(subject="testco", assertion=f"observation {i}",
+                  observed_at=date.today(), extracted_by="risk",
+                  source_url=f"https://a{i}.com")
+            for i in range(3)
+        ]
+        assert asyncio.run(detect_tensions("testco", claims)) == []
+
+    def test_detected_contradiction_becomes_a_report_conflict(self):
+        """The deterministic detector's output must land in the report shape."""
+        from src.agents.evidence import _to_conflict
+        from src.claims.contradictions import detect
+
+        a = _quant_claim(1.9e12, "financial", "https://ft.com/x", SourceTier.TIER1_NEWS)
+        b = _quant_claim(1.4e12, "market", "https://blog.com/y", SourceTier.NEWS)
+        result = detect([a, b])
+        score_claims([a, b], result)
+
+        conflict = _to_conflict(result.contradictions[0])
+        assert conflict["type"] == "factual_contradiction"
+        assert {conflict["agent_a"], conflict["agent_b"]} == {"financial", "market"}
+        assert "payment_volume" in conflict["resolution"]
+        assert 0.0 <= conflict["resolved_confidence"] <= 1.0
+
+
+class TestComputedSectionConfidence:
+    def test_confidence_derived_from_claims_not_guessed(self):
+        strong = _quant_claim(1.0e12, "financial", "https://sec.gov/a", SourceTier.FILING)
+        weak = _quant_claim(5.0e11, "market", "https://x.com/b", SourceTier.SOCIAL)
+        score_claims([strong, weak], None)
+
+        confidences = section_confidences({"claims": [strong, weak]})
+        assert confidences["financial"] > confidences["market"]
+
+    def test_no_claims_yields_no_sections(self):
+        assert section_confidences({"claims": []}) == {}
 
 
 # ---------------------------------------------------------------------------
 # Graph wiring
 # ---------------------------------------------------------------------------
 
+class TestImportHygiene:
+    """`src.state` and `src.claims` reference each other. Every module must
+    still import standalone, in any order — a cycle here only shows up as an
+    ImportError in whichever entry point happens to be imported first."""
+
+    @pytest.mark.parametrize("module", [
+        "src.state",
+        "src.claims",
+        "src.claims.extract",
+        "src.claims.models",
+        "src.graph",
+        "src.agents.evidence",
+        "src.agents.synthesizer",
+    ])
+    def test_module_imports_standalone(self, module):
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-c", f"import {module}"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"{module} failed to import:\n{result.stderr}"
+
+
 class TestGraphTopology:
     def test_all_nodes_present(self):
         nodes = set(app.get_graph().nodes)
         assert {
             "orchestrator", "financial", "market", "risk",
-            "sentiment", "conflict_resolver", "synthesizer",
+            "sentiment", "evidence", "synthesizer",
         } <= nodes
 
     def test_agents_fan_out_and_back_in(self):
         edges = {(e.source, e.target) for e in app.get_graph().edges}
         for agent in ("financial", "market", "risk", "sentiment"):
             assert ("orchestrator", agent) in edges
-            assert (agent, "conflict_resolver") in edges
-        assert ("conflict_resolver", "synthesizer") in edges
+            assert (agent, "evidence") in edges
+        assert ("evidence", "synthesizer") in edges
