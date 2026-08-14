@@ -1,41 +1,34 @@
-import json
 import logging
-from typing import Literal
 
 from pydantic import BaseModel, Field
-from langchain_openai import ChatOpenAI
 
-from src.state import DueDiligenceState, AgentFindings, Conflict
+from src.llm import Tier, get_llm
+from src.models.schemas import ConflictModel
+from src.state import AgentFindings, Conflict, DueDiligenceState
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
-    "You are an analyst reviewing findings from 4 independent research agents. "
+    "You are an analyst reviewing findings from independent research agents. "
     "Compare their findings and identify:\n"
     "- Factual contradictions (agents report different numbers for the same metric)\n"
     "- Complementary tensions (findings that are both true but create a nuanced "
     "picture, e.g. 'growing fast' vs 'burning cash')\n"
     "- Stale data conflicts (one agent has newer data than another)\n\n"
+    "Only compare agents that actually produced findings. "
     "For each conflict, explain the resolution and assign a confidence score."
 )
 
-
-# ---------------------------------------------------------------------------
-# Pydantic schema for structured LLM output
-# ---------------------------------------------------------------------------
-
-class ConflictItem(BaseModel):
-    type: Literal["factual_contradiction", "complementary_tension", "stale_data"]
-    agent_a: str
-    agent_b: str
-    claim_a: str
-    claim_b: str
-    resolution: str
-    resolved_confidence: float = Field(ge=0.0, le=1.0)
+SECTIONS = [
+    ("FINANCIAL", "financial_findings"),
+    ("MARKET", "market_findings"),
+    ("RISK", "risk_findings"),
+    ("SENTIMENT", "sentiment_findings"),
+]
 
 
 class ConflictList(BaseModel):
-    conflicts: list[ConflictItem] = Field(
+    conflicts: list[ConflictModel] = Field(
         default_factory=list,
         description="List of detected conflicts. Empty list if no conflicts found.",
     )
@@ -45,13 +38,8 @@ class ConflictList(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _format_agent_findings(findings: AgentFindings | None) -> str:
-    """Format one agent's findings into a readable block for the LLM prompt."""
-    if not findings:
-        return "(no findings)"
-
-    lines = [f"Agent: {findings['agent_name']}"]
-    lines.append(f"Summary: {findings['summary'][:500]}")
+def _format_agent_findings(findings: AgentFindings) -> str:
+    lines = [f"Agent: {findings['agent_name']}", f"Summary: {findings['summary'][:500]}"]
     for i, f in enumerate(findings["findings"], 1):
         lines.append(
             f"  {i}. [{f['source_quality']}, confidence={f['confidence']}, "
@@ -60,20 +48,21 @@ def _format_agent_findings(findings: AgentFindings | None) -> str:
     return "\n".join(lines)
 
 
-def _build_user_prompt(state: DueDiligenceState) -> str:
-    sections = [
-        ("FINANCIAL FINDINGS", state.get("financial_findings")),
-        ("MARKET FINDINGS", state.get("market_findings")),
-        ("RISK FINDINGS", state.get("risk_findings")),
-        ("SENTIMENT FINDINGS", state.get("sentiment_findings")),
-    ]
-    parts = []
-    for label, findings in sections:
-        parts.append(f"=== {label} ===\n{_format_agent_findings(findings)}")
+def _usable_sections(state: DueDiligenceState) -> list[tuple[str, AgentFindings]]:
+    """Sections from agents that ran successfully and produced findings."""
+    usable = []
+    for label, key in SECTIONS:
+        findings = state.get(key)
+        if findings and findings.get("ok", True) and findings.get("findings"):
+            usable.append((label, findings))
+    return usable
 
+
+def _build_user_prompt(company: str, sections: list[tuple[str, AgentFindings]]) -> str:
+    parts = [f"=== {label} FINDINGS ===\n{_format_agent_findings(f)}" for label, f in sections]
     return (
-        "Below are findings from 4 independent due-diligence agents analyzing "
-        f"{state['company']}. Identify all conflicts between them.\n\n"
+        f"Below are findings from independent due-diligence agents analyzing "
+        f"{company}. Identify all conflicts between them.\n\n"
         + "\n\n".join(parts)
         + "\n\nReturn the list of conflicts. If there are no conflicts, return an empty list."
     )
@@ -85,30 +74,27 @@ def _build_user_prompt(state: DueDiligenceState) -> str:
 
 async def conflict_resolver_node(state: DueDiligenceState) -> dict:
     """LangGraph node: detect and classify conflicts across agent findings."""
-    try:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0)
-        structured_llm = llm.with_structured_output(ConflictList)
+    sections = _usable_sections(state)
 
+    # Conflicts require at least two sources to disagree — skip the call otherwise.
+    if len(sections) < 2:
+        logger.info(
+            "Only %d usable agent result(s) — skipping conflict detection", len(sections)
+        )
+        return {"conflicts": []}
+
+    try:
+        structured_llm = get_llm(Tier.REASONING).with_structured_output(ConflictList)
         result: ConflictList = await structured_llm.ainvoke([
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_user_prompt(state)},
+            {"role": "user", "content": _build_user_prompt(state["company"], sections)},
         ])
 
-        conflicts: list[Conflict] = [
-            Conflict(
-                type=c.type,
-                agent_a=c.agent_a,
-                agent_b=c.agent_b,
-                claim_a=c.claim_a,
-                claim_b=c.claim_b,
-                resolution=c.resolution,
-                resolved_confidence=c.resolved_confidence,
-            )
-            for c in result.conflicts
-        ]
+        conflicts: list[Conflict] = [Conflict(**c.model_dump()) for c in result.conflicts]
+        logger.info("Detected %d conflict(s)", len(conflicts))
 
-    except Exception as exc:
-        logger.error("Conflict resolver failed: %s", exc)
+    except Exception:
+        logger.exception("Conflict resolver failed")
         conflicts = []
 
     return {"conflicts": conflicts}

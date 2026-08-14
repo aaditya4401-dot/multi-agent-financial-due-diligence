@@ -147,9 +147,10 @@ st.markdown("""
     }
 
     /* Verdict badges */
-    .badge-favorable   { background: #1B3A2D; color: #4ADE80; }
-    .badge-cautious    { background: #3A2F1B; color: #FBBF24; }
-    .badge-unfavorable { background: #3A1B1B; color: #F87171; }
+    .badge-favorable    { background: #1B3A2D; color: #4ADE80; }
+    .badge-cautious     { background: #3A2F1B; color: #FBBF24; }
+    .badge-unfavorable  { background: #3A1B1B; color: #F87171; }
+    .badge-inconclusive { background: #1E2030; color: #8B8FA3; }
 
     /* Severity badges */
     .badge-strong { background: #1B3A2D; color: #4ADE80; }
@@ -304,6 +305,7 @@ VERDICT_CLASSES = {
     "Favorable": "badge-favorable",
     "Cautious": "badge-cautious",
     "Unfavorable": "badge-unfavorable",
+    "Inconclusive": "badge-inconclusive",
 }
 
 SEVERITY_CLASSES = {
@@ -341,6 +343,17 @@ def render_severity_badge(severity: str) -> str:
 
 
 def render_findings(section: dict):
+    # An unavailable section means the agent failed — that is unknown, not
+    # a negative finding, and must not be shown as "no issues found".
+    if not section.get("available", True):
+        st.markdown(
+            '<span style="color:#FBBF24;font-size:0.85rem;">'
+            'Unavailable &mdash; this agent failed to run. Treat as unknown, not as a clean result.'
+            '</span>',
+            unsafe_allow_html=True,
+        )
+        return
+
     findings = section.get("findings", [])
     if not findings:
         st.markdown('<span style="color:#555A6E;font-size:0.85rem;">No findings available.</span>',
@@ -404,9 +417,21 @@ if run_clicked and company.strip():
 
     report: dict = state.get("final_report", {})
 
-    if not report or (report.get("overall_score", 0) == 0 and "failed" in report.get("executive_summary", "").lower()):
-        st.error(f"Pipeline failed. {report.get('executive_summary', 'Unknown error')}")
+    if not report:
+        st.error("Pipeline returned no report.")
         st.stop()
+
+    if report.get("overall_verdict") == "Inconclusive":
+        st.error(report.get("executive_summary", "Analysis could not be completed."))
+        st.stop()
+
+    unavailable = report.get("unavailable_sections", [])
+    if unavailable:
+        st.warning(
+            f"Partial analysis — {', '.join(unavailable)} "
+            f"{'agent' if len(unavailable) == 1 else 'agents'} failed. "
+            "Those sections are unknown, not clean."
+        )
 
     # ---- Metric cards ----
     st.markdown("")

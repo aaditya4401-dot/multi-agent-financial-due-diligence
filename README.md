@@ -2,17 +2,20 @@
 
 A multi-agent AI system built with LangGraph that performs automated due diligence on companies by deploying 4 specialized agents in parallel to analyze financial health, market position, risk factors, and public sentiment — then resolves conflicts between agents and synthesizes findings into a structured investment memo with confidence scoring.
 
-![Demo](screenshots/demo.png)
-
 ---
 
 ## Quick Start
 
 ### 1. Clone & install
 
+Requires **Python 3.10+** (the codebase uses PEP 604 `X | None` syntax).
+
 ```bash
 git clone <your-repo-url>
 cd multi-agent-financial-due-diligence
+
+python -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
@@ -44,8 +47,39 @@ Prints the full JSON report to stdout.
 ### 5. Run tests
 
 ```bash
-python -m pytest tests/test_tools.py -v
+python -m pytest tests/ -v
 ```
+
+`tests/test_tools.py` smoke-tests the tool layer (hits the network when keys are
+set). `tests/test_pipeline.py` covers caching, failure semantics, and graph
+wiring entirely offline — no keys needed.
+
+---
+
+## Configuration
+
+Everything below is optional and has a working default.
+
+| Variable | Default | What it controls |
+|---|---|---|
+| `DD_MODEL_FAST` | `gpt-4o-mini` | Cheap tier — mechanical, high-volume work |
+| `DD_MODEL_REASONING` | `gpt-4o` | Research agents and conflict detection |
+| `DD_MODEL_SYNTHESIS` | `gpt-4o` | Final report generation |
+| `DD_AGENT_MAX_STEPS` | `20` | Per-agent tool-loop cap (~10 tool calls) |
+| `DD_GRAPH_RECURSION_LIMIT` | `50` | Whole-graph step ceiling |
+| `DD_LLM_TIMEOUT` | `90` | Per-request timeout, seconds |
+| `DD_LLM_MAX_RETRIES` | `2` | Retries per LLM call |
+| `SEARCH_CACHE_TTL` | `3600` | Search cache lifetime, seconds |
+| `DD_CHECKPOINT_PATH` | unset | SQLite file enabling resumable runs |
+
+Resumable runs need both a checkpoint path and a thread id:
+
+```python
+await run("Stripe", thread_id="stripe-2026-08", checkpoint_path="checkpoints.sqlite")
+```
+
+A crashed run resumes from the last completed node instead of re-paying for
+every agent.
 
 ---
 
@@ -155,22 +189,51 @@ When agents disagree, the resolver classifies conflicts into 3 types:
 
 The resolver is a single structured-output LLM call (not a react agent) that classifies conflicts and assigns confidence scores.
 
-### Graceful Degradation
+### Graceful Degradation — without smoothing over failures
 
-Every agent and tool handles failures without crashing the pipeline:
+Every agent and tool handles failures without crashing the pipeline. If
+yfinance returns nothing (private company), the financial agent falls back to
+web search. If Tavily is down, tools return empty lists.
+
+The important distinction is between **"ran fine, found nothing"** and
+**"failed to run"**. Failed agents are marked `ok=False`, and that propagates:
 
 ```python
-try:
-    data = await call_financial_api(company)
-except Exception:
+def error_findings(agent_name: str, exc: Exception) -> AgentFindings:
     return AgentFindings(
-        findings=[],
-        summary="Financial data unavailable — API error",
-        confidence=0.0
+        agent_name=agent_name,
+        findings=[],        # never fabricate findings for a failed agent
+        summary=f"{agent_name.title()} agent encountered an error: {exc}",
+        data_sources_used=[],
+        ok=False,
     )
 ```
 
-If yfinance fails (e.g. private company), the financial agent falls back to web search. If Tavily is down, tools return empty lists. The report still generates — it just flags which sections have lower reliability.
+Consequences:
+
+- The conflict resolver only compares agents that actually produced findings,
+  and skips the LLM call entirely when fewer than two did.
+- The synthesizer marks failed sections `available: false`, lists them in
+  `unavailable_sections`, and lowers **confidence** rather than **score**.
+- If every agent fails, the report is `Inconclusive` / `Unknown` — not a
+  0/100 `Unfavorable` verdict. A pipeline failure is an absence of evidence,
+  not evidence of a bad investment.
+- The UI renders unavailable sections in amber as "treat as unknown, not as a
+  clean result" instead of silently showing "No findings available."
+
+### Efficiency
+
+- **One search client per event loop**, not one per call, so connections pool
+  across the run.
+- **Cached and coalesced search.** All four agents research the same company,
+  so queries overlap heavily. Identical concurrent queries collapse into a
+  single upstream request; repeats inside the TTL are free.
+- **Cached LLM clients per tier**, instead of constructing a new `ChatOpenAI`
+  inside every node on every invocation.
+- **Model tiering** so cheap work can run on a cheap model (see Configuration).
+- **Agents built once**, lazily, rather than rebuilt per invocation.
+- **Bounded tool loops** — each agent runs under a step cap and degrades to
+  partial findings instead of running away.
 
 ---
 
@@ -186,9 +249,11 @@ multi-agent-due-diligence/
 ├── src/
 │   ├── __init__.py
 │   ├── state.py                  # DueDiligenceState, Finding, AgentFindings, Conflict
+│   ├── llm.py                    # Tiered, cached LLM clients (FAST/REASONING/SYNTHESIS)
 │   ├── graph.py                  # LangGraph StateGraph wiring + CLI entry point
 │   ├── agents/
 │   │   ├── __init__.py
+│   │   ├── base.py               # make_research_agent factory (shared agent machinery)
 │   │   ├── utils.py              # Shared: parse_react_output, error_findings
 │   │   ├── financial.py          # Financial analysis agent (yfinance + Tavily)
 │   │   ├── market.py             # Market research agent (Tavily)
@@ -198,19 +263,21 @@ multi-agent-due-diligence/
 │   │   └── synthesizer.py        # Final report generation (structured output)
 │   ├── tools/
 │   │   ├── __init__.py
-│   │   ├── search_tools.py       # Tavily web search wrapper
+│   │   ├── search_tools.py       # Tavily client pool + TTL cache + request coalescing
 │   │   ├── financial_tools.py    # yfinance + Tavily fallback for financials
 │   │   ├── news_tools.py         # News search + Reddit sentiment via Tavily
 │   │   └── sec_tools.py          # SEC EDGAR filing search via Tavily
 │   └── models/
 │       ├── __init__.py
-│       └── schemas.py            # Pydantic v2 models: DueDiligenceReport, ReportSection, etc.
-├── screenshots/
-│   └── demo.png                  # Streamlit app screenshot
+│       └── schemas.py            # Pydantic v2 report models (single source of truth)
 └── tests/
     ├── __init__.py
-    └── test_tools.py             # Smoke tests for all tool modules
+    ├── test_tools.py             # Smoke tests for all tool modules
+    └── test_pipeline.py          # Caching, failure semantics, graph wiring (offline)
 ```
+
+The four research agents are configuration only — prompt, tools, and target
+state key. All shared machinery lives in `agents/base.py`.
 
 ---
 
@@ -237,30 +304,31 @@ class DueDiligenceReport(BaseModel):
     company_name: str
     report_date: str
     overall_score: int                    # 0-100
-    overall_verdict: Literal["Favorable", "Cautious", "Unfavorable"]
-    risk_level: Literal["Low", "Moderate", "High"]
+    overall_verdict: Literal["Favorable", "Cautious", "Unfavorable", "Inconclusive"]
+    risk_level: Literal["Low", "Moderate", "High", "Unknown"]
     overall_confidence: float             # 0.0-1.0
 
-    financial_section: ReportSection
+    financial_section: ReportSection      # + available: bool
     market_section: ReportSection
     risk_section: ReportSection
     sentiment_section: SentimentSection   # + news_trajectory, developer/employee sentiment
 
-    conflicts_detected: list[Conflict]
+    conflicts_detected: list[ConflictModel]
     executive_summary: str
+    unavailable_sections: list[str]       # agents that failed — unknown, not negative
 ```
+
+This model is the `with_structured_output` target *and* what the UI renders,
+so the requested shape and the consumed shape cannot drift apart.
 
 ---
 
 ## Requirements
 
-```
-langgraph>=0.2.0
-langchain>=0.3.0
-langchain-openai>=0.2.0
-pydantic>=2.0
-yfinance>=0.2.0
-tavily-python>=0.3.0
-streamlit>=1.38.0
-python-dotenv>=1.0.0
-```
+See [`requirements.txt`](requirements.txt). Core stack: LangGraph 1.x,
+LangChain 1.x, Pydantic v2, Tavily, yfinance, Streamlit.
+
+> **Note on LangGraph 1.x:** agents are built with
+> `langchain.agents.create_agent(system_prompt=...)`. The older
+> `langgraph.prebuilt.create_react_agent(state_modifier=...)` is removed —
+> passing `state_modifier` raises `TypeError` on LangGraph 1.x.

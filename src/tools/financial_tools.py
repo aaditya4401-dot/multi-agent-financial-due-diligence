@@ -5,7 +5,7 @@ from datetime import datetime
 import yfinance as yf
 
 from src.state import Finding
-from src.tools.search_tools import search_web
+from src.tools.search_tools import asearch_web
 
 logger = logging.getLogger(__name__)
 
@@ -146,11 +146,7 @@ async def _compute_yoy_growth(ticker: yf.Ticker) -> float | None:
 
 async def _financials_from_web(company: str) -> list[Finding]:
     """Fall back to Tavily web search for financial data (private companies)."""
-    results = await asyncio.to_thread(
-        search_web,
-        f"{company} company revenue valuation financials",
-        5,
-    )
+    results = await asearch_web(f"{company} company revenue valuation financials", 5)
 
     findings: list[Finding] = []
     for r in results:
@@ -185,11 +181,7 @@ async def get_funding_rounds(company: str) -> list[Finding]:
 
     Returns a list[Finding] — empty-with-note on total failure.
     """
-    results = await asyncio.to_thread(
-        search_web,
-        f"{company} funding rounds valuation investors Series",
-        5,
-    )
+    results = await asearch_web(f"{company} funding rounds valuation investors Series", 5)
 
     findings: list[Finding] = []
     for r in results:

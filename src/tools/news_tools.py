@@ -1,9 +1,8 @@
-import asyncio
 import logging
 import re
 from typing import TypedDict
 
-from src.tools.search_tools import search_web
+from src.tools.search_tools import asearch_web
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +34,7 @@ async def search_news(company: str, max_results: int = 5) -> list[NewsArticle]:
     Returns a list[NewsArticle] — empty list on failure.
     """
     try:
-        results = await asyncio.to_thread(
-            search_web,
+        results = await asearch_web(
             f"{company} company latest news",
             max_results,
             search_depth="advanced",
@@ -79,8 +77,7 @@ async def search_reddit_sentiment(company: str, max_results: int = 5) -> list[Re
     Returns a list[RedditPost] — empty list on failure.
     """
     try:
-        results = await asyncio.to_thread(
-            search_web,
+        results = await asearch_web(
             f"{company} company review discussion opinion",
             max_results,
             search_depth="advanced",

@@ -3,9 +3,15 @@ INTERVIEW_PREP.md
 
 # Environment
 .env
+.venv/
+venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Checkpoints
+*.sqlite
+*.sqlite3
 
 # IDE
 .vscode/

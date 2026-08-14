@@ -15,6 +15,8 @@ class AgentFindings(TypedDict):
     findings: list[Finding]
     summary: str
     data_sources_used: list[str]
+    ok: bool                    # False when the agent errored — distinct from
+                                # "ran fine but found nothing"
 
 
 class Conflict(TypedDict):
