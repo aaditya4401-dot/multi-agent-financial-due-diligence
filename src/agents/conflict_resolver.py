@@ -1,114 +1,113 @@
-import json
+"""Qualitative tension detection — the LLM's remaining share of conflict work.
+
+Numeric disagreements are found deterministically in
+:mod:`src.claims.contradictions`. What survives for a model to judge is the
+genuinely qualitative case: two claims that are both true but sit in tension,
+like "growing fast" against "burning cash". There is no arithmetic for that.
+
+Scope is deliberately narrow. The old resolver was handed every finding from
+every agent and asked to find three different kinds of conflict at once. This
+sees only qualitative claims, ranked by confidence, and looks for one thing.
+"""
+
 import logging
 from typing import Literal
 
 from pydantic import BaseModel, Field
-from langchain_openai import ChatOpenAI
 
-from src.state import DueDiligenceState, AgentFindings, Conflict
+from src.claims.models import Claim
+from src.llm import Tier, get_llm
+from src.state import Conflict
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
-    "You are an analyst reviewing findings from 4 independent research agents. "
-    "Compare their findings and identify:\n"
-    "- Factual contradictions (agents report different numbers for the same metric)\n"
-    "- Complementary tensions (findings that are both true but create a nuanced "
-    "picture, e.g. 'growing fast' vs 'burning cash')\n"
-    "- Stale data conflicts (one agent has newer data than another)\n\n"
-    "For each conflict, explain the resolution and assign a confidence score."
+    "You review sourced claims from independent due-diligence agents and find "
+    "**complementary tensions**: pairs of claims that are both plausibly true "
+    "but together paint a more nuanced picture than either alone. For example "
+    "'revenue growing 40% YoY' alongside 'burn rate increased 60%', or "
+    "'compliance issues flagged' alongside 'media coverage remains neutral'.\n\n"
+    "Rules:\n"
+    "- Do NOT report simple numeric disagreements. Those are detected elsewhere.\n"
+    "- Do NOT invent tension between unrelated claims.\n"
+    "- Only pair claims that are genuinely in tension with each other.\n"
+    "- Quote each claim faithfully; never restate it as a stronger assertion.\n"
+    "- `agent_a` and `agent_b` must be the bare agent name shown as "
+    "`agent=...` on each claim, and nothing else.\n"
+    "- If nothing is genuinely in tension, return an empty list. That is a "
+    "valid and common answer."
 )
 
 
-# ---------------------------------------------------------------------------
-# Pydantic schema for structured LLM output
-# ---------------------------------------------------------------------------
+AgentName = Literal["financial", "market", "risk", "sentiment"]
 
-class ConflictItem(BaseModel):
-    type: Literal["factual_contradiction", "complementary_tension", "stale_data"]
-    agent_a: str
-    agent_b: str
+
+class Tension(BaseModel):
+    agent_a: AgentName = Field(description="Agent that made claim_a.")
+    agent_b: AgentName = Field(description="Agent that made claim_b.")
     claim_a: str
     claim_b: str
-    resolution: str
+    resolution: str = Field(
+        description="Why both can be true, and what the combination implies."
+    )
     resolved_confidence: float = Field(ge=0.0, le=1.0)
+    type: Literal["complementary_tension"] = "complementary_tension"
 
 
-class ConflictList(BaseModel):
-    conflicts: list[ConflictItem] = Field(
-        default_factory=list,
-        description="List of detected conflicts. Empty list if no conflicts found.",
+class TensionList(BaseModel):
+    tensions: list[Tension] = Field(default_factory=list)
+
+
+def _format_claims(claims: list[Claim]) -> str:
+    # `agent=` is spelled out so the model copies the bare agent name into
+    # agent_a/agent_b rather than the whole bracketed label.
+    return "\n".join(
+        f"{i}. (agent={c.extracted_by}; source={c.source_tier.value}; "
+        f"confidence={c.confidence:.2f}) {c.assertion[:300]}"
+        for i, c in enumerate(claims, 1)
     )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+async def detect_tensions(subject: str, claims: list[Claim]) -> list[Conflict]:
+    """Find complementary tensions among qualitative claims.
 
-def _format_agent_findings(findings: AgentFindings | None) -> str:
-    """Format one agent's findings into a readable block for the LLM prompt."""
-    if not findings:
-        return "(no findings)"
+    Returns an empty list on any failure — tension detection is additive
+    colour, never a reason to fail a run.
+    """
+    if len(claims) < 2:
+        return []
 
-    lines = [f"Agent: {findings['agent_name']}"]
-    lines.append(f"Summary: {findings['summary'][:500]}")
-    for i, f in enumerate(findings["findings"], 1):
-        lines.append(
-            f"  {i}. [{f['source_quality']}, confidence={f['confidence']}, "
-            f"date={f['date_of_data']}] {f['claim'][:300]}"
-        )
-    return "\n".join(lines)
+    # Tensions are only interesting between different agents' perspectives.
+    if len({c.extracted_by for c in claims}) < 2:
+        return []
 
-
-def _build_user_prompt(state: DueDiligenceState) -> str:
-    sections = [
-        ("FINANCIAL FINDINGS", state.get("financial_findings")),
-        ("MARKET FINDINGS", state.get("market_findings")),
-        ("RISK FINDINGS", state.get("risk_findings")),
-        ("SENTIMENT FINDINGS", state.get("sentiment_findings")),
-    ]
-    parts = []
-    for label, findings in sections:
-        parts.append(f"=== {label} ===\n{_format_agent_findings(findings)}")
-
-    return (
-        "Below are findings from 4 independent due-diligence agents analyzing "
-        f"{state['company']}. Identify all conflicts between them.\n\n"
-        + "\n\n".join(parts)
-        + "\n\nReturn the list of conflicts. If there are no conflicts, return an empty list."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Node
-# ---------------------------------------------------------------------------
-
-async def conflict_resolver_node(state: DueDiligenceState) -> dict:
-    """LangGraph node: detect and classify conflicts across agent findings."""
     try:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0)
-        structured_llm = llm.with_structured_output(ConflictList)
-
-        result: ConflictList = await structured_llm.ainvoke([
+        structured = get_llm(Tier.REASONING).with_structured_output(TensionList)
+        result: TensionList = await structured.ainvoke([
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_user_prompt(state)},
+            {
+                "role": "user",
+                "content": (
+                    f"Claims about {subject}:\n\n{_format_claims(claims)}\n\n"
+                    "Identify complementary tensions between them."
+                ),
+            },
         ])
+    except Exception:
+        logger.exception("Tension detection failed for %r", subject)
+        return []
 
-        conflicts: list[Conflict] = [
-            Conflict(
-                type=c.type,
-                agent_a=c.agent_a,
-                agent_b=c.agent_b,
-                claim_a=c.claim_a,
-                claim_b=c.claim_b,
-                resolution=c.resolution,
-                resolved_confidence=c.resolved_confidence,
-            )
-            for c in result.conflicts
-        ]
-
-    except Exception as exc:
-        logger.error("Conflict resolver failed: %s", exc)
-        conflicts = []
-
-    return {"conflicts": conflicts}
+    conflicts = [
+        Conflict(
+            type="complementary_tension",
+            agent_a=t.agent_a,
+            agent_b=t.agent_b,
+            claim_a=t.claim_a,
+            claim_b=t.claim_b,
+            resolution=t.resolution,
+            resolved_confidence=t.resolved_confidence,
+        )
+        for t in result.tensions
+    ]
+    logger.info("Detected %d complementary tension(s)", len(conflicts))
+    return conflicts

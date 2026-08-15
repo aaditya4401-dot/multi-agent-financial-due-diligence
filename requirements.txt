@@ -1,0 +1,26 @@
+# Core orchestration
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+
+# Resumable runs (checkpointer)
+langgraph-checkpoint-sqlite>=2.0.0
+aiosqlite>=0.20.0
+
+# Schemas
+pydantic>=2.0
+
+# Data sources
+yfinance>=0.2.0
+tavily-python>=0.5.0
+
+# Frontend
+streamlit>=1.38.0
+
+# Config
+python-dotenv>=1.0.0
+
+# Tests
+pytest>=8.0
+pytest-asyncio>=0.24

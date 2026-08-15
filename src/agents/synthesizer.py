@@ -1,75 +1,40 @@
-import json
 import logging
 from datetime import datetime
-from typing import Literal
 
-from pydantic import BaseModel, Field
-from langchain_openai import ChatOpenAI
-
-from src.state import DueDiligenceState, AgentFindings, Conflict
-from src.models.schemas import DueDiligenceReport
+from src.claims.confidence import aggregate_confidence
+from src.claims.models import Claim
+from src.llm import Tier, get_llm
+from src.models.schemas import DueDiligenceReport, inconclusive_report
+from src.state import AgentFindings, Conflict, DueDiligenceState
 
 logger = logging.getLogger(__name__)
+
+#: Claims per section handed to the synthesizer, best evidence first. The old
+#: prompt inlined every raw finding twice over; a ranked digest of typed claims
+#: says more in a fraction of the context.
+MAX_CLAIMS_PER_SECTION = 15
 
 SYSTEM_PROMPT = (
     "You are a senior investment analyst writing a due diligence report. "
     "Synthesize findings from financial, market, risk, and sentiment analyses. "
     "Account for detected conflicts and their resolutions. "
     "Assign an overall score (0-100), verdict, and risk level. "
-    "Be concise but thorough."
+    "Be concise but thorough.\n\n"
+    "Some agents may have failed to run. Their sections are marked "
+    "UNAVAILABLE. Treat an unavailable section as unknown, never as a "
+    "negative finding: set its `available` field to false, leave its findings "
+    "empty, list the agent in `unavailable_sections`, and lower "
+    "`overall_confidence` to reflect the missing evidence. Do not lower "
+    "`overall_score` because a section is missing. If no section ran "
+    "successfully, return the verdict 'Inconclusive' and risk level 'Unknown'."
 )
 
-
-# ---------------------------------------------------------------------------
-# Pydantic schema for structured LLM output (self-contained, no TypedDict refs)
-# ---------------------------------------------------------------------------
-
-class LLMReportFinding(BaseModel):
-    claim: str
-    severity: Literal["Strong", "Watch", "Flag", "Low"]
-    confidence: float = Field(ge=0.0, le=1.0)
-    source: str
-
-
-class LLMReportSection(BaseModel):
-    findings: list[LLMReportFinding]
-    section_confidence: float = Field(ge=0.0, le=1.0)
-
-
-class LLMSentimentSection(BaseModel):
-    findings: list[LLMReportFinding]
-    section_confidence: float = Field(ge=0.0, le=1.0)
-    news_trajectory: str
-    developer_sentiment: str
-    employee_sentiment: str
-
-
-class LLMConflict(BaseModel):
-    type: Literal["factual_contradiction", "complementary_tension", "stale_data"]
-    agent_a: str
-    agent_b: str
-    claim_a: str
-    claim_b: str
-    resolution: str
-    resolved_confidence: float = Field(ge=0.0, le=1.0)
-
-
-class LLMReport(BaseModel):
-    """Full due diligence report — used as structured output target for the LLM."""
-    company_name: str
-    report_date: str
-    overall_score: int = Field(ge=0, le=100)
-    overall_verdict: Literal["Favorable", "Cautious", "Unfavorable"]
-    risk_level: Literal["Low", "Moderate", "High"]
-    overall_confidence: float = Field(ge=0.0, le=1.0)
-
-    financial_section: LLMReportSection
-    market_section: LLMReportSection
-    risk_section: LLMReportSection
-    sentiment_section: LLMSentimentSection
-
-    conflicts_detected: list[LLMConflict]
-    executive_summary: str
+SECTIONS = [
+    ("FINANCIAL", "financial_findings"),
+    ("MARKET", "market_findings"),
+    ("RISK", "risk_findings"),
+    ("SENTIMENT", "sentiment_findings"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -78,52 +43,140 @@ class LLMReport(BaseModel):
 
 def _format_findings(findings: AgentFindings | None) -> str:
     if not findings:
-        return "(no findings)"
+        return "UNAVAILABLE — agent did not run."
+    if not findings.get("ok", True):
+        return f"UNAVAILABLE — {findings.get('summary', 'agent failed')}"
+
     lines = [f"Agent: {findings['agent_name']}", f"Summary: {findings['summary'][:500]}"]
     for i, f in enumerate(findings["findings"], 1):
         lines.append(
             f"  {i}. [{f['source_quality']}, confidence={f['confidence']}, "
             f"date={f['date_of_data']}] {f['claim'][:300]}"
         )
+    if not findings["findings"]:
+        lines.append("  (ran successfully but surfaced no specific findings)")
     return "\n".join(lines)
 
 
 def _format_conflicts(conflicts: list[Conflict]) -> str:
     if not conflicts:
         return "(no conflicts detected)"
-    lines = []
-    for i, c in enumerate(conflicts, 1):
-        lines.append(
-            f"  {i}. [{c['type']}] {c['agent_a']} vs {c['agent_b']}: "
-            f"'{c['claim_a'][:150]}' vs '{c['claim_b'][:150]}' — "
-            f"Resolution: {c['resolution'][:200]} (confidence={c['resolved_confidence']})"
-        )
+    return "\n".join(
+        f"  {i}. [{c['type']}] {c['agent_a']} vs {c['agent_b']}: "
+        f"'{c['claim_a'][:150]}' vs '{c['claim_b'][:150]}' — "
+        f"Resolution: {c['resolution'][:200]} (confidence={c['resolved_confidence']})"
+        for i, c in enumerate(conflicts, 1)
+    )
+
+
+def failed_agents(state: DueDiligenceState) -> list[str]:
+    """Names of agents that errored out, for the report's unavailable list."""
+    failed = []
+    for label, key in SECTIONS:
+        findings = state.get(key)
+        if not findings or not findings.get("ok", True):
+            failed.append(label.lower())
+    return failed
+
+
+def claims_by_agent(state: DueDiligenceState) -> dict[str, list[Claim]]:
+    """Group scored claims by the agent that produced them, best evidence first."""
+    grouped: dict[str, list[Claim]] = {}
+    for claim in state.get("claims") or []:
+        grouped.setdefault(claim.extracted_by, []).append(claim)
+    for claims in grouped.values():
+        claims.sort(key=lambda c: c.confidence, reverse=True)
+    return grouped
+
+
+def section_confidences(state: DueDiligenceState) -> dict[str, float]:
+    """Confidence per section, derived from its claims rather than guessed."""
+    return {
+        agent: aggregate_confidence(claims)
+        for agent, claims in claims_by_agent(state).items()
+    }
+
+
+def _format_claims(claims: list[Claim]) -> str:
+    lines = [
+        f"  {i}. {c.describe()}\n     {c.assertion[:250]}"
+        for i, c in enumerate(claims[:MAX_CLAIMS_PER_SECTION], 1)
+    ]
+    if len(claims) > MAX_CLAIMS_PER_SECTION:
+        lines.append(f"  … and {len(claims) - MAX_CLAIMS_PER_SECTION} lower-confidence claim(s)")
     return "\n".join(lines)
 
 
 def _build_user_prompt(state: DueDiligenceState) -> str:
-    sections = [
-        ("FINANCIAL FINDINGS", state.get("financial_findings")),
-        ("MARKET FINDINGS", state.get("market_findings")),
-        ("RISK FINDINGS", state.get("risk_findings")),
-        ("SENTIMENT FINDINGS", state.get("sentiment_findings")),
-    ]
-    parts = [f"=== {label} ===\n{_format_findings(f)}" for label, f in sections]
+    grouped = claims_by_agent(state)
 
-    conflicts = state.get("conflicts", [])
-    parts.append(f"=== CONFLICTS DETECTED ===\n{_format_conflicts(conflicts)}")
+    parts = []
+    for label, key in SECTIONS:
+        findings = state.get(key)
+        agent = label.lower()
+
+        if not findings or not findings.get("ok", True):
+            parts.append(f"=== {label} ===\n{_format_findings(findings)}")
+        elif grouped.get(agent):
+            parts.append(
+                f"=== {label} CLAIMS "
+                f"(confidence {aggregate_confidence(grouped[agent]):.0%}) ===\n"
+                f"{_format_claims(grouped[agent])}"
+            )
+        else:
+            # No claims extracted — fall back to the raw findings.
+            parts.append(f"=== {label} FINDINGS ===\n{_format_findings(findings)}")
+    parts.append(f"=== CONFLICTS DETECTED ===\n{_format_conflicts(state.get('conflicts', []))}")
 
     today = datetime.now().strftime("%Y-%m-%d")
+    unavailable = failed_agents(state)
+    note = (
+        f"\n\nNOTE: these agents failed and their sections are unknown: "
+        f"{', '.join(unavailable)}."
+        if unavailable else ""
+    )
+
     return (
         f"Produce a due diligence report for {state['company']} (report date: {today}).\n\n"
         + "\n\n".join(parts)
+        + note
         + "\n\nSynthesize everything into a structured investment memo."
     )
 
 
-def _to_final_report(llm_report: LLMReport) -> dict:
-    """Convert the LLM's Pydantic output to a DueDiligenceReport-compatible dict."""
-    return llm_report.model_dump()
+def _apply_computed_confidence(
+    report: DueDiligenceReport,
+    state: DueDiligenceState,
+    unavailable: list[str],
+) -> None:
+    """Replace the model's guessed confidences with values derived from evidence.
+
+    Section confidence is the aggregate of that section's scored claims, and
+    overall confidence is the mean across available sections. A model asked to
+    rate its own certainty will produce a plausible number; this produces a
+    traceable one.
+    """
+    computed = section_confidences(state)
+    if not computed:
+        return
+
+    available: list[float] = []
+    for agent in ("financial", "market", "risk", "sentiment"):
+        section = getattr(report, f"{agent}_section", None)
+        if section is None:
+            continue
+
+        if agent in unavailable:
+            section.available = False
+            section.section_confidence = 0.0
+            continue
+
+        if agent in computed:
+            section.section_confidence = computed[agent]
+            available.append(computed[agent])
+
+    if available:
+        report.overall_confidence = round(sum(available) / len(available), 4)
 
 
 # ---------------------------------------------------------------------------
@@ -132,37 +185,31 @@ def _to_final_report(llm_report: LLMReport) -> dict:
 
 async def synthesizer_node(state: DueDiligenceState) -> dict:
     """LangGraph node: synthesize all findings into a final DueDiligenceReport."""
-    try:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0)
-        structured_llm = llm.with_structured_output(LLMReport)
+    company = state["company"]
+    today = datetime.now().strftime("%Y-%m-%d")
+    unavailable = failed_agents(state)
 
-        result: LLMReport = await structured_llm.ainvoke([
+    if len(unavailable) == len(SECTIONS):
+        logger.error("All agents failed for %r — reporting inconclusive", company)
+        report = inconclusive_report(
+            company, today, "every research agent failed to produce findings"
+        )
+        return {"final_report": report.model_dump()}
+
+    try:
+        structured_llm = get_llm(Tier.SYNTHESIS).with_structured_output(DueDiligenceReport)
+        result: DueDiligenceReport = await structured_llm.ainvoke([
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": _build_user_prompt(state)},
         ])
 
-        report = _to_final_report(result)
+        # Trust our own bookkeeping over the model's self-report.
+        result.unavailable_sections = unavailable
+        _apply_computed_confidence(result, state, unavailable)
+        report = result
 
     except Exception as exc:
-        logger.error("Synthesizer failed: %s", exc)
-        report = {
-            "company_name": state["company"],
-            "report_date": datetime.now().strftime("%Y-%m-%d"),
-            "overall_score": 0,
-            "overall_verdict": "Unfavorable",
-            "risk_level": "High",
-            "overall_confidence": 0.0,
-            "financial_section": {"findings": [], "section_confidence": 0.0},
-            "market_section": {"findings": [], "section_confidence": 0.0},
-            "risk_section": {"findings": [], "section_confidence": 0.0},
-            "sentiment_section": {
-                "findings": [], "section_confidence": 0.0,
-                "news_trajectory": "Unknown",
-                "developer_sentiment": "Unknown",
-                "employee_sentiment": "Unknown",
-            },
-            "conflicts_detected": [],
-            "executive_summary": f"Report generation failed: {exc}",
-        }
+        logger.exception("Synthesizer failed for %r", company)
+        report = inconclusive_report(company, today, f"report generation failed ({exc})")
 
-    return {"final_report": report}
+    return {"final_report": report.model_dump()}

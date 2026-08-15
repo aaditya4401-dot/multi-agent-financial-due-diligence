@@ -3,7 +3,7 @@ import logging
 import re
 from typing import TypedDict
 
-from src.tools.search_tools import search_web
+from src.tools.search_tools import asearch_web
 
 logger = logging.getLogger(__name__)
 
@@ -35,15 +35,13 @@ async def search_sec_filings(company: str, max_results: int = 5) -> list[SECFili
     Returns a list[SECFiling] — empty list on failure.
     """
     edgar_results, regulatory_results = await asyncio.gather(
-        asyncio.to_thread(
-            search_web,
+        asearch_web(
             f"{company} SEC EDGAR filing 10-K 10-Q 8-K",
             max_results,
             search_depth="advanced",
             include_domains=["sec.gov"],
         ),
-        asyncio.to_thread(
-            search_web,
+        asearch_web(
             f"{company} SEC regulatory action enforcement fine",
             max_results,
             search_depth="advanced",

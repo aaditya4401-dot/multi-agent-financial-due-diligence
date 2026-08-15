@@ -61,20 +61,20 @@ def parse_react_output(agent_name: str, agent_output: dict) -> AgentFindings:
         findings=findings,
         summary=summary,
         data_sources_used=list(set(data_sources)),
+        ok=True,
     )
 
 
 def error_findings(agent_name: str, exc: Exception) -> AgentFindings:
-    """Return a placeholder AgentFindings for a completely failed agent."""
+    """Return a placeholder AgentFindings for a completely failed agent.
+
+    Marked ``ok=False`` so the synthesizer reports the section as unknown
+    rather than folding the failure into a low score.
+    """
     return AgentFindings(
         agent_name=agent_name,
-        findings=[Finding(
-            claim=f"{agent_name.title()} analysis failed: {exc}",
-            source="system",
-            confidence=0.0,
-            source_quality="news_article",
-            date_of_data=today(),
-        )],
+        findings=[],
         summary=f"{agent_name.title()} agent encountered an error: {exc}",
         data_sources_used=[],
+        ok=False,
     )
