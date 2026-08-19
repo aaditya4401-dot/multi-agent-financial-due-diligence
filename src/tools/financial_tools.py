@@ -42,16 +42,36 @@ async def get_company_financials(company: str) -> list[Finding]:
     return await _financials_from_web(company)
 
 
-async def _financials_from_yfinance(company: str) -> list[Finding]:
-    """Pull structured financials from yfinance (runs sync IO in a thread)."""
+async def lookup_ticker_info(candidate: str) -> dict | None:
+    """Resolve *candidate* to live market data, or ``None`` if it is not real.
+
+    The single definition of "this ticker exists". The planner uses it to
+    verify a model's guess before treating a company as public; the financials
+    tool uses it to decide whether the yfinance path is worth taking at all.
+    Two copies of this check would be two things that could disagree.
+
+    ``quoteType`` is the discriminator: yfinance hands back a ``Ticker`` object
+    for any string whatsoever, and an unresolvable one yields an ``info`` dict
+    with no quote type rather than an error.
+    """
+    if not candidate or not candidate.strip():
+        return None
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, company)
+        ticker = await asyncio.to_thread(yf.Ticker, candidate.strip())
         info: dict = await asyncio.to_thread(lambda: ticker.info)
     except Exception as exc:
-        logger.error("yfinance Ticker lookup failed for %r: %s", company, exc)
-        return []
+        logger.error("yfinance Ticker lookup failed for %r: %s", candidate, exc)
+        return None
 
     if not info or info.get("quoteType") is None:
+        return None
+    return info
+
+
+async def _financials_from_yfinance(company: str) -> list[Finding]:
+    """Pull structured financials from yfinance (runs sync IO in a thread)."""
+    info = await lookup_ticker_info(company)
+    if info is None:
         return []
 
     findings: list[Finding] = []

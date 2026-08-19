@@ -2,7 +2,7 @@ import json
 
 from langchain_core.tools import tool
 
-from src.agents.base import make_research_agent
+from src.agents.spec import AgentSpec
 from src.tools.financial_tools import get_company_financials, get_funding_rounds
 from src.tools.search_tools import asearch_web
 
@@ -39,10 +39,9 @@ async def tool_search_web(query: str) -> str:
 
 TOOLS = [tool_get_company_financials, tool_get_funding_rounds, tool_search_web]
 
-financial_agent = make_research_agent(
+SPEC = AgentSpec(
     name="financial",
-    state_key="financial_findings",
     system_prompt=SYSTEM_PROMPT,
-    tools=TOOLS,
     task_prompt=TASK_PROMPT,
+    tools=tuple(TOOLS),
 )

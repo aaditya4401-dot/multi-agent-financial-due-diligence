@@ -5,9 +5,12 @@ the shape the LLM is asked for and the shape the UI renders can never drift
 apart. (They previously did: the synthesizer carried its own parallel copy.)
 """
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+
+from src.eval.models import EvaluationReport
+from src.models.thesis import InvestmentThesis
 
 Verdict = Literal["Favorable", "Cautious", "Unfavorable", "Inconclusive"]
 RiskLevel = Literal["Low", "Moderate", "High", "Unknown"]
@@ -66,9 +69,30 @@ class DueDiligenceReport(BaseModel):
 
     unavailable_sections: list[str] = Field(
         default_factory=list,
-        description="Names of agents that failed. Their sections carry no "
-                    "signal and must not be read as negative findings.",
+        description="Names of agents that ran and failed. Their sections carry "
+                    "no signal and must not be read as negative findings.",
     )
+
+    skipped_sections: list[str] = Field(
+        default_factory=list,
+        description="Names of agents deliberately left out of the research "
+                    "plan. Distinct from a failure: nothing went wrong and no "
+                    "evidence is missing, so these must not reduce confidence.",
+    )
+
+
+class FinalReport(DueDiligenceReport):
+    """The artefact the UI renders: the drafted report plus the thesis.
+
+    Kept separate from :class:`DueDiligenceReport` so the synthesizer's
+    ``with_structured_output`` target contains only what the model should
+    author. The thesis is formed by its own node against the claim graph and
+    attached here — asking the synthesizer to write one too would produce a
+    second, ungrounded version of the same view.
+    """
+
+    thesis: Optional[InvestmentThesis] = None
+    evaluation: Optional[EvaluationReport] = None
 
 
 def inconclusive_report(company: str, report_date: str, reason: str) -> DueDiligenceReport:

@@ -2,7 +2,7 @@ import json
 
 from langchain_core.tools import tool
 
-from src.agents.base import make_research_agent
+from src.agents.spec import AgentSpec
 from src.tools.search_tools import asearch_web
 from src.tools.sec_tools import search_sec_filings
 
@@ -35,10 +35,9 @@ async def tool_search_risk_info(query: str) -> str:
 
 TOOLS = [tool_search_sec_filings, tool_search_risk_info]
 
-risk_agent = make_research_agent(
+SPEC = AgentSpec(
     name="risk",
-    state_key="risk_findings",
     system_prompt=SYSTEM_PROMPT,
-    tools=TOOLS,
     task_prompt=TASK_PROMPT,
+    tools=tuple(TOOLS),
 )
