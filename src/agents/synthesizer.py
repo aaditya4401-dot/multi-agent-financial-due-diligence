@@ -279,6 +279,34 @@ def _apply_computed_confidence(
         report.overall_confidence = round(sum(available) / len(available), 4)
 
 
+def _nothing_to_report(
+    unavailable: list[str], skipped: list[str], state: DueDiligenceState
+) -> str:
+    """Say which of the two happened, because they are not the same thing.
+
+    A run where every agent crashed and a run a reviewer cancelled both end with
+    no findings, but reporting the second as "every research agent failed" is a
+    false statement about the system's own behaviour — and exactly the
+    skipped-versus-failed conflation the rest of this module exists to avoid.
+    """
+    if unavailable and not skipped:
+        return "every research agent failed to produce findings"
+
+    if skipped and not unavailable:
+        plan = state.get("plan")
+        if plan is not None and not plan.tasks:
+            return (
+                "no research was run for this company — the plan dispatched no "
+                f"tasks. {plan.rationale}".strip()
+            )
+        return f"no research was run: {', '.join(skipped)} were not researched"
+
+    return (
+        f"{', '.join(unavailable)} failed and {', '.join(skipped)} were not "
+        f"researched, leaving nothing to report on"
+    )
+
+
 def _finalize(report: DueDiligenceReport, state: DueDiligenceState) -> FinalReport:
     """Attach the thesis the model was never asked to author."""
     return FinalReport(**report.model_dump(), thesis=state.get("thesis"))
@@ -295,9 +323,10 @@ async def synthesizer_node(state: DueDiligenceState) -> dict:
     unavailable, skipped = agent_status(state)
 
     if len(unavailable) + len(skipped) == len(SECTIONS):
-        logger.error("No section produced findings for %r — reporting inconclusive", company)
+        logger.info(
+            "No section produced findings for %r — reporting inconclusive", company)
         report = inconclusive_report(
-            company, today, "every research agent failed to produce findings"
+            company, today, _nothing_to_report(unavailable, skipped, state)
         )
         report.skipped_sections = skipped
         report.unavailable_sections = unavailable

@@ -199,6 +199,34 @@ class TestFailureSemantics:
             "financial", "market", "risk", "sentiment"
         ]
 
+    def test_cancelled_run_is_not_reported_as_a_failure(self):
+        """A reviewer cancelling and every agent crashing both end with no
+        findings, but calling the first one a failure is a false statement
+        about the system's own behaviour.
+
+        Found by driving the Streamlit gate, not by a unit test — the empty
+        plan only arises through the approval path.
+        """
+        cancelled = plan_for("TestCo").model_copy(update={"tasks": []})
+        state = {"company": "TestCo", "conflicts": [], "findings": [],
+                 "plan": cancelled}
+
+        report = asyncio.run(synthesizer_node(state))["final_report"]
+        summary = report["executive_summary"]
+        assert "no research was run" in summary
+        assert "failed" not in summary
+        assert report["overall_verdict"] == "Inconclusive"
+
+    def test_genuine_total_failure_still_says_failed(self):
+        """The other side of the same coin — don't soften a real failure."""
+        state = {
+            "company": "TestCo", "conflicts": [],
+            "findings": [_findings(a, ok=False)
+                         for a in ("financial", "market", "risk", "sentiment")],
+        }
+        report = asyncio.run(synthesizer_node(state))["final_report"]
+        assert "failed" in report["executive_summary"]
+
     def test_report_dump_matches_schema(self):
         r = inconclusive_report("TestCo", "2026-08-14", "reason")
         assert DueDiligenceReport.model_validate(r.model_dump())
