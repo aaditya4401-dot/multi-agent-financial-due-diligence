@@ -118,50 +118,201 @@ User Input: "Analyze Stripe"
         │
         ▼
 ┌─────────────────────┐
-│   Orchestrator      │  ← LangGraph StateGraph
-│   (routes, manages) │
+│      Planner        │  ← classifies public/private,
+│  (classify + route) │     emits a ResearchPlan
+└──────────┬──────────┘
+           ▼
+┌─────────────────────┐
+│   Approval Gate     │  ← optional human review, before
+│  (interrupt/resume) │     a single dollar is spent
 └────┬───┬───┬───┬────┘
-     │   │   │   │        ← Fan-out (parallel execution)
-     ▼   ▼   ▼   ▼
+     │   │   │   │        ← Fan-out: one Send per planned
+     ▼   ▼   ▼   ▼          task, width decided at runtime
    ┌───┐┌───┐┌───┐┌───┐
-   │ F ││ M ││ R ││ S │  ← 4 independent agents
-   │ i ││ a ││ i ││ e │     each with own LLM + tools
-   │ n ││ r ││ s ││ n │
+   │ F ││ M ││ R ││ S │  ← N invocations of one research
+   │ i ││ a ││ i ││ e │     node, each with the tools the
+   │ n ││ r ││ s ││ n │     plan selected for it
    └─┬─┘└─┬─┘└─┬─┘└─┬─┘
-     │   │   │   │        ← Fan-in (merge results)
-     ▼   ▼   ▼   ▼
+     │   │   │   │        ← Fan-in: one edge, fires once
+     ▼   ▼   ▼   ▼          however many tasks ran
 ┌─────────────────────┐
 │      Evidence       │  ← Extracts typed claims, then
 │ extract→detect→score│     detects contradictions by
 └──────────┬──────────┘     groupby — no LLM guesswork
            ▼
 ┌─────────────────────┐
-│   Synthesizer       │  ← Produces structured
-│   (final report)    │     investment memo
+│    Gap Analyzer     │  ← Is this good enough? Ranks
+│  coverage/conflict/ │     gaps by value of information
+│  confidence/recency │
+└──────┬───────┬──────┘
+       │       └──────────────────┐
+       │ good enough              │ thin — one more round of
+       ▼                          │ narrow, targeted research
+┌─────────────────────┐           │
+│      Thesis         │           └──> back to research ──┐
+│ (grounded in claims)│  ← falsifiable drivers, each      │
+└──────────┬──────────┘     citing claim ids; invented    │
+           ▼                citations stripped            │
+┌─────────────────────┐                                    │
+│   Synthesizer       │                                    │
+│   (final report)    │                                    │
+└──────────┬──────────┘  <─────────────────────────────────┘
+           ▼
+┌─────────────────────┐
+│    Evaluation       │  ← scores the report against the
+│   (groundedness)    │     evidence: are its figures real?
 └──────────┬──────────┘
            ▼
    Due Diligence Report
-   (with derived confidence)
+   (derived confidence +
+    groundedness score)
 ```
 
 ### How the graph is wired
 
 ```python
-# Fan-out: orchestrator → all 4 agents in parallel
-workflow.add_edge("orchestrator", "financial")
-workflow.add_edge("orchestrator", "market")
-workflow.add_edge("orchestrator", "risk")
-workflow.add_edge("orchestrator", "sentiment")
+# Fan-out: one Send per planned task. The number of tasks is a runtime
+# decision, so this cannot be a fixed set of edges.
+workflow.add_conditional_edges("planner", dispatch_research, ["research", "synthesizer"])
 
-# Fan-in: all 4 → conflict resolver
-workflow.add_edge(["financial", "market", "risk", "sentiment"], "conflict_resolver")
+# Fan-in: a single edge, which fires once after every dispatched task
+# finishes — whatever N was.
+workflow.add_edge("research", "evidence")
 
-# Linear: resolver → synthesizer → END
-workflow.add_edge("conflict_resolver", "synthesizer")
+# Linear: evidence → synthesizer → END
+workflow.add_edge("evidence", "synthesizer")
 workflow.add_edge("synthesizer", END)
 ```
 
-LangGraph runs all four agent nodes concurrently via asyncio. Each node writes to its own state field (`financial_findings`, `market_findings`, etc.) — no write conflicts. Shared fields (`conflicts`, `messages`) use `Annotated[list, add]` reducers that concatenate results.
+**Why `Send` rather than conditional edges to four fixed nodes.** A conditional
+edge chooses a *path* among known nodes; `Send` chooses a *population*. Only the
+latter lets the planner decide how many research tasks exist at runtime.
+
+**Why the fan-in changed.** The old fan-in named all four agents in one
+`add_edge([...], ...)` call, which is a join: it fires only when every named
+node has run. That barrier can never tolerate a variable-width fan-out — skip
+one agent and the graph stalls. A single `research → evidence` edge fires once
+regardless of how many tasks were dispatched.
+
+**Why findings are one reducer-backed list.** Two parallel writes to the same
+state key raise `InvalidUpdateError`, so a fixed key per agent cannot express
+two tasks aimed at the same agent. Tasks append to
+`findings: Annotated[list[AgentFindings], add]` instead, and each block carries
+its own `agent_name`. `conflicts` and `messages` use the same reducer pattern.
+
+### What the planner actually decides
+
+Classification is deliberately split in two: the model supplies **recall** (it
+knows Block, Inc. trades as a ticker and Stripe does not trade at all), and a
+market-data lookup supplies **verification**. A proposed ticker that fails to
+resolve downgrades the company to `unknown`, never to `private` — no ticker is
+not proof of privateness, and the costs are asymmetric.
+
+The plan changes *tools and focus*, not which agents run:
+
+| | Public | Private |
+|---|---|---|
+| financial tools | market data + web | funding rounds + web |
+| dropped, and why | funding history is noise for a listed company | the ticker lookup is a guaranteed miss |
+| caveat | — | figures are third-party estimates |
+
+Skipping a whole agent is not justifiable on listing status alone, so Phase 1
+does not do it. The skip machinery exists for the human approval gate, where a
+reviewer can deselect an agent before it spends — and a skipped section is
+reported separately from a failed one, because only one of them is an evidence
+gap.
+
+### Evaluation
+
+Two layers, answering different questions. **Groundedness** — does the report
+only assert what we found? — is deterministic, free, and runs as the last node
+on every run, so the score is attached to the report rather than living in a
+benchmark someone might remember to run. The **judge** — is the report any
+good? — is an LLM against a five-criterion rubric, and runs offline over a
+fixture set.
+
+Groundedness first, and not merely in file order: a judge scoring prose without
+a groundedness check is theatre, because a fluent report that cites nothing real
+scores well on clarity and structure.
+
+The load-bearing check is **unsupported figures**. A memo is mostly numbers, and
+a number matching no claim reads as researched fact while being invented. Only
+figures with a magnitude marker are checked — `$1.4T`, `38%`, `100 million` —
+because bare integers like years and counts would produce false positives that
+bury the real findings.
+
+```
+python -m src.graph Stripe --save reports/stripe.json
+python scripts/evaluate.py reports/*.json --judge
+```
+
+### The investment thesis
+
+The memo's analytical core: a one-line thesis, 3-5 **falsifiable drivers**,
+bull/base/bear cases, red flags graded by whether they end the conversation, and
+a recommendation whose rationale traces back to the drivers.
+
+Every driver must cite `evidence_claim_ids` and state `what_would_falsify_this`.
+Both are schema-enforced — an uncited driver fails validation, and "revenue is
+growing" is an observation, not a driver.
+
+Citations are then checked against the **actual claim graph**: invented ids are
+stripped, a driver left with no valid citation is dropped, and if nothing
+survives the recommendation is forced to `Insufficient evidence`. Pydantic can
+enforce that a citation exists; only code with access to the run can enforce
+that it is true.
+
+This is the concrete payoff for typed claims. Groundedness is a set membership
+test — `cited_ids <= {c.id for c in claims}` — because claims carry stable ids.
+Against prose findings it would be another LLM judging whether one sentence
+supports another.
+
+`open_questions` is generated from the gap analyzer rather than authored by the
+model: the system already knows precisely what it could not establish.
+
+Deliberately not built: SWOT and Porter's Five Forces. They are teaching
+frameworks, not artefacts of real diligence.
+
+### Human in the loop
+
+`run(company, human_review=True)` pauses after planning and before any agent
+runs. The reviewer can approve, drop agents, or cancel; a dropped agent is
+reported as *not researched* rather than as a failure, and their note lands in
+the report's audit trail.
+
+The gate is its own node containing nothing but the `interrupt()` call, because
+**an interrupting node re-executes from the top on resume** — anything above
+that line runs twice. Putting the gate at the end of the planner would have paid
+for classification twice per approval, silently.
+
+An interrupt is a checkpoint, so human review makes checkpointing mandatory
+rather than optional, and `src/checkpointing.py` declares an explicit allowlist
+of the project types that travel in that state.
+
+### The refinement loop
+
+`gap_analyzer` sits between evidence and synthesis and answers one question: is
+this worth writing up, or is there a specific thing worth paying for another
+round of research to find?
+
+Gap detection is **deterministic** — four pure functions over the claim graph
+(missing core metrics, unresolved contradictions, weak sections, stale figures).
+No model decides whether the evidence is thin, so that decision can be unit
+tested rather than trusted.
+
+Gaps are ranked by **value of information**, `kind_weight x importance x
+residual_uncertainty`, and gaps below a threshold buy nothing. "Is anything
+unresolved?" is always yes, forever. "Would resolving this change the verdict?"
+is the question worth money.
+
+**The loop provably terminates** — a round ceiling, an attempted-gap set that
+only grows (so the candidate set strictly shrinks), and a finite gap space. The
+recursion limit is a backstop, not the mechanism.
+
+**And it converges rather than repeating.** Each follow-up carries the gap's own
+question as its focus and is told not to redo the broad survey. A loop that
+re-runs the original prompt is not a loop, it is a retry: same prompt, same
+tools, same answer, twice the cost.
 
 ---
 
