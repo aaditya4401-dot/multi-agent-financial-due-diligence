@@ -1,6 +1,18 @@
 # Multi-Agent Due Diligence System
 
-A multi-agent AI system built with LangGraph that performs automated due diligence on companies by deploying 4 specialized agents in parallel to analyze financial health, market position, risk factors, and public sentiment — then resolves conflicts between agents and synthesizes findings into a structured investment memo with confidence scoring.
+A multi-agent AI system built with LangGraph that performs automated due diligence
+on companies. A planner decides what research to run; specialized agents cover
+financial health, market position, risk and sentiment in parallel; their prose is
+converted into a **typed claim graph** so contradictions are found by arithmetic
+rather than by asking a model to eyeball two paragraphs. Thin evidence buys another
+round of targeted research, an investment thesis is formed with every driver cited
+to a claim id, and the finished memo is scored for groundedness before it is
+returned.
+
+The design bet, stated once: **use the LLM only where the work is genuinely
+semantic.** Extraction and qualitative tension get a model. Detection,
+adjudication, confidence, gap-finding and groundedness are pure Python — so they
+can be unit tested instead of trusted.
 
 ---
 
@@ -171,17 +183,28 @@ User Input: "Analyze Stripe"
 ### How the graph is wired
 
 ```python
+# Plan, then a review gate that is a no-op unless human_review is set.
+workflow.set_entry_point("planner")
+workflow.add_edge("planner", "approval")
+
 # Fan-out: one Send per planned task. The number of tasks is a runtime
 # decision, so this cannot be a fixed set of edges.
-workflow.add_conditional_edges("planner", dispatch_research, ["research", "synthesizer"])
+workflow.add_conditional_edges("approval", dispatch_research, ["research", "thesis"])
 
 # Fan-in: a single edge, which fires once after every dispatched task
 # finishes — whatever N was.
 workflow.add_edge("research", "evidence")
 
-# Linear: evidence → synthesizer → END
-workflow.add_edge("evidence", "synthesizer")
-workflow.add_edge("synthesizer", END)
+# The cycle: thin evidence buys another round of narrow research. Termination
+# is enforced inside gap_analyzer, not by this wiring.
+workflow.add_edge("evidence", "gap_analyzer")
+workflow.add_conditional_edges("gap_analyzer", route_after_gaps, ["research", "thesis"])
+
+# A view is formed before the memo is written, and the finished memo is scored
+# against the evidence behind it before it leaves the graph.
+workflow.add_edge("thesis", "synthesizer")
+workflow.add_edge("synthesizer", "evaluation")
+workflow.add_edge("evaluation", END)
 ```
 
 **Why `Send` rather than conditional edges to four fixed nodes.** A conditional
@@ -456,22 +479,36 @@ multi-agent-due-diligence/
 ├── requirements.txt
 ├── .env                          # API keys (OPENAI_API_KEY, TAVILY_API_KEY)
 ├── app.py                        # Streamlit frontend (dark fintech theme)
+├── scripts/
+│   └── evaluate.py               # Offline judge run over saved report fixtures
 ├── src/
 │   ├── __init__.py
 │   ├── state.py                  # DueDiligenceState, Finding, AgentFindings, Conflict
 │   ├── llm.py                    # Tiered, cached LLM clients (FAST/REASONING/SYNTHESIS)
+│   ├── checkpointing.py          # Serializer allowlist for interrupt/resume state
 │   ├── graph.py                  # LangGraph StateGraph wiring + CLI entry point
+│   ├── planning/
+│   │   ├── __init__.py
+│   │   ├── classify.py           # Public/private classification (recall + ticker verification)
+│   │   ├── plan.py               # Company type → ResearchPlan (tasks, tools, caveats)
+│   │   └── models.py             # ResearchPlan, ResearchTask, CompanyType
 │   ├── agents/
 │   │   ├── __init__.py
-│   │   ├── base.py               # make_research_agent factory (shared agent machinery)
+│   │   ├── base.py               # research_node: runs whichever ResearchTask it's handed
+│   │   ├── registry.py           # AGENT_SPECS — per-agent prompt/tools/tier config
+│   │   ├── spec.py               # AgentSpec: tool resolution, task composition
 │   │   ├── utils.py              # Shared: parse_react_output, error_findings
-│   │   ├── financial.py          # Financial analysis agent (yfinance + Tavily)
-│   │   ├── market.py             # Market research agent (Tavily)
-│   │   ├── risk.py               # Risk assessment agent (SEC + Tavily)
-│   │   ├── sentiment.py          # Sentiment analysis agent (news + Reddit + Tavily)
+│   │   ├── financial.py          # Financial agent config (yfinance + Tavily)
+│   │   ├── market.py             # Market agent config (Tavily)
+│   │   ├── risk.py               # Risk agent config (SEC + Tavily)
+│   │   ├── sentiment.py          # Sentiment agent config (news + Reddit + Tavily)
 │   │   ├── evidence.py           # extract → detect → score → conflicts
 │   │   ├── conflict_resolver.py  # Qualitative tension detection (the LLM's share)
-│   │   └── synthesizer.py        # Final report generation (structured output)
+│   │   ├── gap_analyzer.py       # Refinement loop: is this good enough, or one more round?
+│   │   ├── thesis.py             # Investment thesis, citation-audited against claims
+│   │   ├── synthesizer.py        # Final report generation (structured output)
+│   │   ├── evaluation.py         # Groundedness scoring node, last before END
+│   │   └── approval.py           # Human-in-the-loop plan review gate (interrupt/resume)
 │   ├── claims/
 │   │   ├── __init__.py
 │   │   ├── models.py             # Claim, SourceTier, domain-based tiering
@@ -479,6 +516,15 @@ multi-agent-due-diligence/
 │   │   ├── extract.py            # Findings → typed claims (FAST tier)
 │   │   ├── contradictions.py     # Deterministic detection + adjudication
 │   │   └── confidence.py         # Confidence propagation
+│   ├── gaps/
+│   │   ├── __init__.py
+│   │   ├── models.py             # Gap, GapKind
+│   │   └── detect.py             # Four deterministic gap-finding passes, ranked by VoI
+│   ├── eval/
+│   │   ├── __init__.py
+│   │   ├── models.py             # GroundednessCheck, EvaluationReport, CitationAudit
+│   │   ├── groundedness.py       # Deterministic: does the report assert only what we found?
+│   │   └── judge.py              # LLM-judged rubric score, run offline over fixtures
 │   ├── tools/
 │   │   ├── __init__.py
 │   │   ├── search_tools.py       # Tavily client pool + TTL cache + request coalescing
@@ -487,12 +533,20 @@ multi-agent-due-diligence/
 │   │   └── sec_tools.py          # SEC EDGAR filing search via Tavily
 │   └── models/
 │       ├── __init__.py
-│       └── schemas.py            # Pydantic v2 report models (single source of truth)
+│       ├── schemas.py            # Pydantic v2 report models (single source of truth)
+│       └── thesis.py             # InvestmentThesis, Driver, RedFlag models
 └── tests/
     ├── __init__.py
-    ├── test_tools.py             # Smoke tests for all tool modules
+    ├── conftest.py
+    ├── test_tools.py             # Smoke tests for all tool modules (hits network)
     ├── test_pipeline.py          # Caching, failure semantics, graph wiring (offline)
-    └── test_claims.py            # Normalization, detection, confidence (offline)
+    ├── test_claims.py            # Normalization, detection, confidence (offline)
+    ├── test_planning.py          # Classification + plan generation (offline)
+    ├── test_gaps.py              # Gap detection + value of information (offline)
+    ├── test_thesis.py            # Citation audit + validation (offline)
+    ├── test_approval.py          # Human-in-the-loop interrupt/resume (offline)
+    ├── test_checkpointing.py     # Serializer allowlist (offline)
+    └── test_eval.py              # Groundedness checks (offline)
 ```
 
 The four research agents are configuration only — prompt, tools, and target
