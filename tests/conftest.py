@@ -27,9 +27,27 @@ import pytest
 #: existing, deliberate integration tests. What was *not* deliberate is a
 #: synthesis-tier model call escaping from a unit test, which is both the
 #: expensive path and the one whose assertions assume it cannot happen.
+#:
+#: The LangSmith vars are here for the same reason, one step removed. Tracing is
+#: opt-in via ``LANGSMITH_TRACING``, but that switch is read from the ambient
+#: environment — so a developer who exports it in their shell, or lists it in
+#: ``.env``, would have this suite start shipping traces of every stubbed run to
+#: a real project. That is network I/O in tests that are supposed to be offline,
+#: and it pollutes whatever project the key points at. Scrubbing them here keeps
+#: "tracing is off unless asked for" true in tests by construction, exactly as
+#: the credential scrub does for model calls. Tests that exercise the tracing
+#: path set these themselves with ``monkeypatch.setenv``.
 _CREDENTIAL_VARS = (
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
+    "LANGSMITH_TRACING",
+    "LANGSMITH_API_KEY",
+    "LANGSMITH_PROJECT",
+    "LANGSMITH_ENDPOINT",
+    # The pre-0.11 spellings. langsmith still honours them, so leaving them set
+    # would re-enable tracing through the back door.
+    "LANGCHAIN_TRACING_V2",
+    "LANGCHAIN_API_KEY",
 )
 
 

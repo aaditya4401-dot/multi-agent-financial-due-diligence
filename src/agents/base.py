@@ -31,6 +31,7 @@ from langgraph.errors import GraphRecursionError
 from src.agents.registry import AGENT_SPECS
 from src.agents.utils import error_findings, parse_react_output
 from src.llm import get_llm
+from src.observability import annotate_current_run
 from src.planning.models import ResearchTask
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,20 @@ async def research_node(payload: dict) -> dict:
     logger.info(
         "%s agent researching %r with %s",
         spec.name, company, [t.name for t in tools],
+    )
+
+    # Name the span after the agent. Research tasks fan out via Send, so a
+    # round produces several concurrent runs of this one node — all called
+    # "research" and otherwise impossible to tell apart in a trace. `focus` is
+    # what distinguishes a refinement task from the original broad survey.
+    annotate_current_run(
+        name=f"agent:{spec.name}",
+        **{
+            "dd.agent": spec.name,
+            "dd.routing_tier": spec.tier.value,
+            "dd.tools": [t.name for t in tools],
+            "dd.is_refinement": bool(task.focus),
+        },
     )
 
     try:

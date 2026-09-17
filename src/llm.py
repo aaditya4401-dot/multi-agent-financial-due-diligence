@@ -57,10 +57,28 @@ def get_llm(tier: Tier = Tier.REASONING, temperature: float = 0.0) -> ChatOpenAI
 
     Cached on (tier, temperature), so repeated calls reuse one client and its
     underlying connection pool. ChatOpenAI is safe to share across tasks.
+
+    The tier is stamped onto the client as tags and metadata, which is what
+    makes cost and latency groupable by tier in a trace. It belongs *here*
+    rather than at the seven call sites for a reason worth stating: tier is a
+    property of the client, not of the run. It is part of this cache key, so a
+    given client always has exactly one tier, and stamping it once covers every
+    call site — including the ReAct loop in ``agents/base.py``, whose nested
+    model calls inherit it without that node having to know tracing exists.
+
+    The same argument runs the other way for anything run-scoped. Per-run
+    callbacks must *never* be attached here: this cache outlives the run, so
+    one run's callbacks would fire for every later run. Those go through
+    ``config`` at invoke time instead. See ``src/observability.py``.
     """
     return ChatOpenAI(
         model=model_name(tier),
         temperature=temperature,
         timeout=REQUEST_TIMEOUT_SECONDS,
         max_retries=MAX_RETRIES,
+        # "routing_tier", not "tier": SourceTier in src/claims/models.py is an
+        # unrelated evidence-quality grade, and one ambiguous "tier" column in
+        # the trace UI would be worse than none.
+        tags=[f"tier:{tier.value}"],
+        metadata={"routing_tier": tier.value, "routing_model": model_name(tier)},
     )

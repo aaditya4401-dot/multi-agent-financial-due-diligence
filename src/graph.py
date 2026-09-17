@@ -17,6 +17,7 @@ from src.agents.evidence import evidence_node
 from src.agents.gap_analyzer import gap_analyzer_node
 from src.agents.synthesizer import synthesizer_node
 from src.agents.thesis import thesis_node
+from src.observability import finalize, trace_run
 from src.planning.classify import classify_company
 from src.planning.plan import plan_for
 from pydantic import BaseModel
@@ -280,6 +281,7 @@ async def run(
         "thesis": None,
         "thesis_audit": None,
         "evaluation": None,
+        "approvals": [],
         "messages": [],
     }
     config: dict[str, Any] = {"recursion_limit": GRAPH_RECURSION_LIMIT}
@@ -287,12 +289,37 @@ async def run(
 
     # Unattended and unresumable: no checkpointer needed, so don't pay for one.
     if not human_review and not thread_id:
-        return await app.ainvoke(initial_state, config=config)
+        # Tracing attaches here, to the config, rather than at compile time —
+        # this function has two invocation paths (this one and the checkpointed
+        # one below) and compile-time callbacks would cover only one of them.
+        # A disabled handle leaves `config` exactly as it is.
+        state = {}
+        with trace_run(company) as handle:
+            handle.apply_to(config)
+            try:
+                state = await app.ainvoke(initial_state, config=config)
+            finally:
+                # Inside the `with`, so the metadata lands while the root run
+                # is still open — LangSmith refuses a second update once it
+                # closes. In `finally` so a run that raised is still described,
+                # and so tracing can never mask the pipeline's own exception.
+                handle.record(state)
+        # Feedback goes after the run is closed, which is fine: it is a
+        # separate resource and wants the run to already exist.
+        finalize(handle, state)
+        return state
 
     thread_id = thread_id or uuid4().hex
     config["configurable"] = {"thread_id": thread_id}
-    async with _checkpointed_app(path) as graph:
-        state = await graph.ainvoke(initial_state, config=config)
+    state = {}
+    with trace_run(company, thread_id) as handle:
+        handle.apply_to(config)
+        try:
+            async with _checkpointed_app(path) as graph:
+                state = await graph.ainvoke(initial_state, config=config)
+        finally:
+            handle.record(state)
+    finalize(handle, state)
 
     state["__thread_id__"] = thread_id
     return state
@@ -319,8 +346,26 @@ async def resume(
         "configurable": {"thread_id": thread_id},
     }
     path = checkpoint_path or os.getenv("DD_CHECKPOINT_PATH")
-    async with _checkpointed_app(path) as graph:
-        state = await graph.ainvoke(Command(resume=decision), config=config)
+
+    # A resumed segment is its own root run — the original ended when the graph
+    # interrupted, possibly in another process on another day. Passing the same
+    # thread_id groups the segments in LangSmith instead of pretending they are
+    # one run. Feedback lands on whichever segment actually reached evaluation,
+    # which is this one if the run finishes here.
+    # The company name lives in the checkpoint, and reading it back just to
+    # label a span is not worth an extra round-trip — handle.record() corrects
+    # the name once the returned state reveals it, while the run is still open.
+    state = {}
+    with trace_run(f"resumed {thread_id[:8]}", thread_id,
+                   stage="resume") as handle:
+        handle.apply_to(config)
+        try:
+            async with _checkpointed_app(path) as graph:
+                state = await graph.ainvoke(Command(resume=decision),
+                                            config=config)
+        finally:
+            handle.record(state)
+    finalize(handle, state)
 
     state["__thread_id__"] = thread_id
     return state

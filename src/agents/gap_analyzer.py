@@ -32,6 +32,7 @@ import os
 
 from src.gaps.detect import RESEARCH_AGENTS, find_gaps
 from src.gaps.models import Gap
+from src.observability import annotate_current_run
 from src.planning.models import CompanyType, ResearchPlan, ResearchTask
 from src.state import DueDiligenceState
 
@@ -87,11 +88,22 @@ async def gap_analyzer_node(state: DueDiligenceState) -> dict:
     round_no = int(state.get("research_round") or 0)
     attempted = set(state.get("attempted_gaps") or [])
 
+    # Label this lap. Every round re-enters this node and so already gets its
+    # own span; without the round number they are indistinguishable in the UI.
+    annotate_current_run(
+        name=f"planning_iteration_{round_no}",
+        **{
+            "dd.research_round": round_no,
+            "dd.gaps_attempted_so_far": len(attempted),
+            "dd.round_ceiling": MAX_REFINEMENT_ROUNDS,
+        },
+    )
+
     gaps = find_gaps(
         state.get("claims") or [], subject, company_type, planned)
     open_gaps = [g for g in gaps if g.id not in attempted]
 
-    def stop(reason: str) -> dict:
+    def stop(reason: str, code: str) -> dict:
         logger.info(
             "Round %d: proceeding to synthesis — %s (%d open gap(s))",
             round_no, reason, len(open_gaps),
@@ -100,11 +112,17 @@ async def gap_analyzer_node(state: DueDiligenceState) -> dict:
             "gaps": open_gaps,
             "refine_tasks": [],
             "research_round": round_no + 1,
+            # Why the loop stopped, as a code rather than a sentence. It cannot
+            # be inferred afterwards: this counter is incremented on both exits,
+            # so a run that genuinely converged ends at the ceiling and is
+            # indistinguishable from one that ran out of budget.
+            "refine_stop_reason": code,
             "messages": [f"Evidence review round {round_no + 1}: {reason}."],
         }
 
     if round_no >= MAX_REFINEMENT_ROUNDS:
-        return stop(f"refinement budget of {MAX_REFINEMENT_ROUNDS} round(s) spent")
+        return stop(f"refinement budget of {MAX_REFINEMENT_ROUNDS} round(s) spent",
+                    "round_ceiling")
 
     worth_it = [
         g for g in open_gaps
@@ -112,7 +130,7 @@ async def gap_analyzer_node(state: DueDiligenceState) -> dict:
     ][:MAX_TASKS_PER_ROUND]
 
     if not worth_it:
-        return stop("no remaining gap would move the verdict")
+        return stop("no remaining gap would move the verdict", "converged")
 
     tasks = [_task_for(gap, plan) for gap in worth_it]
     logger.info(

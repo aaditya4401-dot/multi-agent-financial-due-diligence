@@ -47,6 +47,16 @@ class DueDiligenceState(TypedDict):
     plan: Optional[ResearchPlan]                # what the planner decided, and why
     human_review: bool                          # pause for approval before spending
 
+    # What the reviewer actually did, as data rather than prose. The decision
+    # was already recorded in `messages`, but only as a sentence written for a
+    # human to read — parsing it back to answer "did a human intervene, and
+    # where" would mean depending on log wording as if it were an API. Each
+    # entry is {stage, action, dropped_agents}; reducer-backed and keyed by
+    # stage because the graph tolerates more than one gate even though only
+    # the plan gate exists today. Plain dicts, so the checkpoint serializer
+    # allowlist needs no new entry.
+    approvals: Annotated[list[dict], add]
+
     # One reducer-backed list rather than four Optional keys. Research tasks
     # are dispatched via Send, so their number is decided at runtime: a fixed
     # key per agent cannot express two tasks aimed at the same agent, and two
@@ -73,6 +83,11 @@ class DueDiligenceState(TypedDict):
     gaps: list[Gap]                             # open gaps, recomputed each pass
     refine_tasks: list[ResearchTask]            # what to re-research; empty means stop
     attempted_gaps: Annotated[list[str], add]   # gap ids already dispatched, never reissued
+
+    # Why the loop stopped: "converged" | "round_ceiling". Recorded rather than
+    # inferred, because research_round is incremented on both exits and so a
+    # converged run is indistinguishable from an exhausted one afterwards.
+    refine_stop_reason: NotRequired[str]
 
     thesis: Optional[InvestmentThesis]           # formed before the memo is written
     thesis_audit: Optional[CitationAudit]        # what citation checking discarded

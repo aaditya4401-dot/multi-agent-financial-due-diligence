@@ -34,6 +34,12 @@ from src.state import DueDiligenceState
 
 logger = logging.getLogger(__name__)
 
+#: Which gate this is. There is exactly one today — before any research is
+#: dispatched, which is the last moment a reviewer can stop the spending — but
+#: the graph's resume loop already tolerates several, so the stage travels with
+#: the decision rather than being assumed by whoever reads it back.
+APPROVAL_STAGE = "plan"
+
 
 def _as_decision(raw: Any) -> PlanDecision:
     """Interpret whatever came back through the interrupt.
@@ -112,6 +118,15 @@ async def approval_node(state: DueDiligenceState) -> dict:
 
     return {
         "plan": revised,
+        # The same event twice, for two different readers. `messages` is the
+        # human-readable audit trail; `approvals` is the machine-readable one
+        # that tracing reports as run metadata. Keeping them separate means the
+        # sentence above stays free to be reworded without breaking anything.
+        "approvals": [{
+            "stage": APPROVAL_STAGE,
+            "action": decision.action,
+            "dropped_agents": dropped,
+        }],
         "messages": [
             f"Human review: {decision.action}"
             + (f", dropped {', '.join(dropped)}" if dropped else "")
