@@ -178,35 +178,61 @@ When you analyze **Stripe**, the system produces:
 
 The full analysis runs in ~60 seconds with all 4 agents executing concurrently.
 
-**What it actually cost** — measured, not estimated. These are the run metadata
-and feedback scores from one traced Stripe run, read back off the LangSmith API:
+**What it actually costs** — measured across **5 traced runs**, not estimated
+from one. Median, with the full range across runs in brackets. These figures are
+not copied by hand; they are read back off the LangSmith API, and anyone with
+access to the project can regenerate them:
+
+```bash
+python scripts/trace_stats.py --company Stripe --markdown
+```
 
 | | |
 |---|---|
-| Wall clock | 57s |
-| Total tokens | 52,088 |
-| Model calls | 16, across 3 tiers |
-| Trace spans | 86 |
-| Claims extracted | 34 |
-| Conflicts detected | 4 |
-| Groundedness | **0.93** |
-| Citation grounding rate | 1.00 (0 invented citations) |
+| Wall clock | 57s (44s–140s) |
+| Total tokens | 55,033 (51,486–61,070) |
+| Claims extracted | 31 (30–41) |
+| Conflicts detected | 3 (3–4) |
+| Planning iterations | 1 (1–2) |
+| `groundedness` | 0.856 (0.826–0.929) |
+| `groundedness:claims_have_sources` | 0.854 (0.767–1.000) |
+| `groundedness:figures_traceable` | 0.579 (0.538–0.731) |
+| `groundedness:thesis_drivers_grounded` | 1.000 |
+| `groundedness:sections_backed_by_claims` | 1.000 |
+| `citation_grounding_rate` | 1.000 |
+| `invented_citations` | 0 |
 
 Cost by routing tier — the number the tiering exists to produce, and the reason
 it is worth grouping by tier rather than reporting one total:
 
 | Tier | Model | Calls | Tokens | Share |
 |---|---|---|---|---|
-| `fast` | gpt-4o-mini | 5 | 15,054 | 29% |
-| `reasoning` | gpt-4o | 9 | 28,103 | 54% |
-| `synthesis` | gpt-4o | 2 | 8,931 | 17% |
+| `fast` | gpt-4o-mini | 5 (5–6) | 15,412 (14,808–17,311) | 28% |
+| `reasoning` | gpt-4o | 9 (9–12) | 30,360 (28,103–34,290) | 55% |
+| `synthesis` | gpt-4o | 2 | 8,931 (8,093–9,469) | 16% |
 
 `reasoning` dominates because it carries the four research agents and their tool
 loops — which makes it the obvious target if cost matters, and that is a
 conclusion the system can now support with a number instead of an intuition.
-
 The per-tier totals sum exactly to LangSmith's independently computed total for
-the run, which is the cheapest available check that the accounting is right.
+each run, which is the cheapest available check that the accounting is right.
+
+**Read the ranges, not just the medians.** Live search returns different results
+every run, so the inputs genuinely differ: `reasoning` spends 9–12 model calls
+depending on how many tool calls each agent needs, and one run took 140s against
+a 44s best case. `figures_traceable` is the widest quality spread (0.538–0.731)
+because it depends on which figures the model happened to quote from whatever
+search returned — which is exactly what that check exists to catch.
+
+Two things the range makes visible that a single run hides: the refinement loop
+*does* fire (`planning_iterations` reaching 2) on runs where a gap clears the
+value-of-information bar, and the invariants hold on every run — zero invented
+citations, every thesis driver grounded, every section backed by claims.
+
+> Numbers from a single run are an anecdote. Two runs happened to agree closely
+> enough here to suggest cost was near-deterministic, which five runs disproved.
+> The script exists so the figures are cheap to re-derive rather than quietly
+> stale.
 
 ---
 
@@ -707,7 +733,8 @@ multi-agent-due-diligence/
 ├── .env.example                  # Every variable the system reads, with placeholders
 ├── app.py                        # Streamlit frontend (dark fintech theme)
 ├── scripts/
-│   └── evaluate.py               # Offline judge run over saved report fixtures
+│   ├── evaluate.py               # Offline judge run over saved report fixtures
+│   └── trace_stats.py            # Aggregate cost/quality across traced runs (read-only)
 ├── src/
 │   ├── __init__.py
 │   ├── state.py                  # DueDiligenceState, Finding, AgentFindings, Conflict
