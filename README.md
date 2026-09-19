@@ -14,6 +14,31 @@ semantic.** Extraction and qualitative tension get a model. Detection,
 adjudication, confidence, gap-finding and groundedness are pure Python — so they
 can be unit tested instead of trusted.
 
+Every run is traceable end to end. Optional **LangSmith** instrumentation records
+cost and latency grouped by routing tier, how much work the refinement loop
+actually did, and pushes the groundedness and citation-audit results onto the run
+as feedback scores — so report quality is tracked across runs rather than
+inspected one report at a time. It is off unless configured, and cannot fail a
+run.
+
+---
+
+## At a glance
+
+| | |
+|---|---|
+| **Orchestration** | LangGraph `StateGraph` — cyclic, with runtime fan-out via `Send` |
+| **Agents** | 4 research agents (financial, market, risk, sentiment), running concurrently |
+| **Planning** | Dynamic: classification decides how many agents run and which tools each may reach |
+| **Refinement** | Evidence → gap analysis → targeted re-research, with provable termination |
+| **Human in the loop** | `interrupt()`-based approval gate; resumable across processes via SQLite checkpoints |
+| **Evidence model** | Pydantic v2 typed claim graph; contradictions found by arithmetic, not by an LLM |
+| **Cost control** | 3-tier model routing (`fast` / `reasoning` / `synthesis`), cached clients, coalesced search |
+| **Evaluation** | Deterministic groundedness on every run + citation audit; LLM rubric judge offline |
+| **Observability** | LangSmith: per-tier cost and latency, run metadata, evaluator scores as feedback |
+| **Tests** | 317, offline by construction — no keys, no network, no spend |
+| **Stack** | Python 3.10+, LangGraph 1.x, LangChain 1.x, Pydantic v2, LangSmith, Tavily, yfinance, Streamlit |
+
 ---
 
 ## Quick Start
@@ -33,11 +58,21 @@ pip install -r requirements.txt
 
 ### 2. Configure API keys
 
-Create a `.env` file in the project root:
+Copy the template and fill it in — `.env.example` documents every variable the
+system reads, with placeholders. `.env` is gitignored; `.env.example` is not, and
+must never hold a real key.
+
+```bash
+cp .env.example .env
+```
 
 ```env
 OPENAI_API_KEY=sk-...        # Required — powers all 4 agents + resolver + synthesizer
 TAVILY_API_KEY=tvly-...      # Required — web search, news, Reddit, SEC filings
+
+LANGSMITH_TRACING=true       # Optional — tracing is off unless this AND the key are set
+LANGSMITH_API_KEY=lsv2_pt_...
+LANGSMITH_PROJECT=multi-agent-due-diligence
 ```
 
 ### 3. Run the Streamlit app
@@ -59,12 +94,18 @@ Prints the full JSON report to stdout.
 ### 5. Run tests
 
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/ -q
 ```
 
-`tests/test_tools.py` smoke-tests the tool layer (hits the network when keys are
-set). `tests/test_pipeline.py` covers caching, failure semantics, and graph
-wiring entirely offline — no keys needed.
+**317 tests, and all but one module run offline** — no keys, no network, no spend.
+`tests/test_tools.py` is the deliberate exception: it smoke-tests the tool layer
+against live APIs when keys are present, and skips when they are not.
+
+Offline is guaranteed by construction, not by convention. `tests/conftest.py`
+scrubs model credentials *and* the LangSmith variables for the whole session,
+because both had the same failure mode: a suite that quietly spends money — or
+quietly ships traces to a real project — when a developer happens to have the
+variable exported. The suite's environment is part of its contract.
 
 ---
 
@@ -83,6 +124,22 @@ Everything below is optional and has a working default.
 | `DD_LLM_MAX_RETRIES` | `2` | Retries per LLM call |
 | `SEARCH_CACHE_TTL` | `3600` | Search cache lifetime, seconds |
 | `DD_CHECKPOINT_PATH` | unset | SQLite file enabling resumable runs |
+| `DD_MAX_REFINEMENT_ROUNDS` | `1` | Hard ceiling on the research → evidence → gap cycle |
+| `DD_MAX_REFINE_TASKS` | `3` | Follow-up tasks dispatched per round |
+| `DD_MIN_GAP_VOI` | `0.5` | Value-of-information floor a gap must clear to be worth another round |
+
+**Observability** — all optional, all inert when tracing is off.
+
+| Variable | Default | What it controls |
+|---|---|---|
+| `LANGSMITH_TRACING` | unset | Master switch. Tracing needs this **and** the key |
+| `LANGSMITH_API_KEY` | unset | Personal access token from smith.langchain.com |
+| `LANGSMITH_PROJECT` | unset | Project runs are grouped under |
+| `LANGSMITH_ENDPOINT` | unset | Self-hosted or EU only; leave unset for default |
+| `DD_TRACE_FINALIZE_TIMEOUT` | `10` | Wall clock on end-of-run telemetry, seconds |
+| `DD_TRACE_CONNECT_TIMEOUT_MS` | `2000` | Connect timeout for the tracing client |
+| `DD_TRACE_READ_TIMEOUT_MS` | `5000` | Read timeout for the tracing client |
+| `DD_TRACE_RETRIES` | `1` | Retries per tracing request — deliberately near-zero |
 
 Resumable runs need both a checkpoint path and a thread id:
 
@@ -120,6 +177,36 @@ When you analyze **Stripe**, the system produces:
 3. **Complementary Tension** — Risk agent flagged compliance challenges while Sentiment agent found neutral media coverage. Both true — compliance issues haven't yet impacted public perception.
 
 The full analysis runs in ~60 seconds with all 4 agents executing concurrently.
+
+**What it actually cost** — measured, not estimated. These are the run metadata
+and feedback scores from one traced Stripe run, read back off the LangSmith API:
+
+| | |
+|---|---|
+| Wall clock | 57s |
+| Total tokens | 52,088 |
+| Model calls | 16, across 3 tiers |
+| Trace spans | 86 |
+| Claims extracted | 34 |
+| Conflicts detected | 4 |
+| Groundedness | **0.93** |
+| Citation grounding rate | 1.00 (0 invented citations) |
+
+Cost by routing tier — the number the tiering exists to produce, and the reason
+it is worth grouping by tier rather than reporting one total:
+
+| Tier | Model | Calls | Tokens | Share |
+|---|---|---|---|---|
+| `fast` | gpt-4o-mini | 5 | 15,054 | 29% |
+| `reasoning` | gpt-4o | 9 | 28,103 | 54% |
+| `synthesis` | gpt-4o | 2 | 8,931 | 17% |
+
+`reasoning` dominates because it carries the four research agents and their tool
+loops — which makes it the obvious target if cost matters, and that is a
+conclusion the system can now support with a number instead of an intuition.
+
+The per-tier totals sum exactly to LangSmith's independently computed total for
+the run, which is the cheapest available check that the accounting is right.
 
 ---
 
@@ -268,6 +355,108 @@ bury the real findings.
 python -m src.graph Stripe --save reports/stripe.json
 python scripts/evaluate.py reports/*.json --judge
 ```
+
+### Observability
+
+The pipeline used to run blind. Seven model call sites across three tiers, a
+refinement loop of variable length, and a groundedness score computed on every
+run — none of it visible afterwards. There was no token accounting anywhere, so
+the tiering that exists specifically to control cost could not be shown to work.
+
+`src/observability.py` is the whole integration. The rest of the pipeline gains
+134 lines across six files — 59 of them comments — because the goal was to keep
+tracing concentrated in one module rather than smeared through every node. It
+answers three questions — *what did this cost, per tier*,
+*how much work did the loop do*, *was the output grounded* — and records nothing
+that does not answer one of them.
+
+**Off by default, and inert when off.** Tracing requires `LANGSMITH_TRACING` and
+`LANGSMITH_API_KEY` both set. With either missing no client is constructed, no
+callbacks are attached, and the invoke config is byte-for-byte what it was
+before. Requiring the key as well as the switch means a half-configured
+environment degrades to *off* rather than to a run that errors on every call.
+
+**It cannot fail a run, and it cannot stall one.** Every entry point is wrapped
+in a single `fail_open` primitive — one audited decorator rather than try/except
+scattered across a dozen call sites. But catching exceptions is only half of
+failing open: an unreachable endpoint does not raise, it *stalls*, and with the
+client's default retry policy a single feedback call blocks for minutes. So the
+client is built with short timeouts and near-zero retries, and finalisation runs
+under a wall clock on a daemon thread. Unreachable costs seconds, not minutes.
+
+#### Where the instrumentation attaches, and why
+
+Three placement decisions, each of which has a wrong version that looks fine
+until it doesn't.
+
+**Tier is stamped on the cached client, not at the seven call sites.** `get_llm`
+is `lru_cache`d on `(tier, temperature)`, so tier is a property of *the client* —
+a given client always has exactly one. Stamping it at construction covers every
+call site in four lines, including the nested ReAct loop, whose model calls
+inherit it without `research_node` knowing tracing exists.
+
+The same reasoning inverted is why per-run callbacks must **never** go there: the
+cache outlives the run, so a usage collector attached to the client would fire
+for every later run in the process. Run-scoped things travel in `config` at
+invoke time. Ask of every field: *is this a property of the client, or of the
+run?* — the answers differ inside one file.
+
+**The pipeline opens its own root run.** LangSmith rejects a second update to a
+finished run (`409 Duplicate run update requests`), because the tracer already
+sent one when the run closed. A fact learned only at the end therefore has two
+possible homes: something still open when you learn it, or a separate resource
+with its own lifecycle. So `trace_run` owns the root, `record()` writes the
+end-of-run metadata while it is still alive, and feedback — a separate resource
+by design — is pushed afterwards.
+
+**`gap_analyzer` records why the loop stopped instead of leaving it to be
+inferred.** The round counter is incremented on *both* exits, so a run that
+converged on its first pass finishes sitting exactly on the ceiling and is
+indistinguishable from one that ran out of budget. Inference got this wrong in
+the flattering direction — reporting "budget spent" for a loop that had simply
+found nothing worth chasing. The node knew; it now says so.
+
+> The general rule: instrument at the decision point. Downstream reconstruction
+> is lossy exactly where the paths converge, which is exactly where you care.
+
+#### What lands on a run
+
+Naming note: `routing_tier`, never bare `tier` — `SourceTier` in the claim graph
+is an unrelated evidence-quality grade, and one ambiguous column in a trace UI is
+permanent. Metadata keys are a schema.
+
+- **Trace tree** — one root run per execution; a child per graph node; research
+  spans named per agent (`agent:financial`, `agent:risk`, …) because four tasks
+  fan out via `Send` and would otherwise all read `research`; one
+  `planning_iteration_N` span per lap of the refinement cycle.
+- **Every model call** carries `routing_tier` and a `tier:*` tag, so cost and
+  latency group three ways in the UI.
+- **Run metadata** — planning iterations, why the loop stopped, whether the
+  approval gate fired and at which stage, per-tier token and call counts, claim
+  and conflict counts, and whether the run completed or is paused at a gate.
+- **Feedback scores** — 7 per run: aggregate `groundedness`, one key per named
+  groundedness check, `citation_grounding_rate` and `invented_citations`.
+
+The evaluators are **wired through, not reimplemented**. `EvaluationReport` and
+`CitationAudit` already carry exactly the numbers the feedback API wants, so this
+is transport. Per-check keys are generated by iterating the evaluator's output,
+so a fifth check added to `groundedness.py` appears in LangSmith with no change
+to the tracing code.
+
+Token counts come from a callback rather than return values, because
+`.with_structured_output()` returns the parsed model and discards `usage_metadata`
+at six of the seven call sites — the numbers are simply not in the return value.
+A `BaseCallbackHandler` sees them anyway, joining `on_chat_model_start` (which
+carries the tier) to `on_llm_end` (which carries the usage) on `run_id`.
+
+#### Human review spans more than one run
+
+A reviewed execution is `run()` plus one `resume()` per gate — separate root runs,
+potentially in different processes days apart. There is no honest way to make
+those one run: the parent would have to survive a boundary it cannot, and an
+abandoned review would leave it open forever. So each segment is its own root run,
+grouped by thread id, and feedback lands on the segment that actually reached
+`evaluation` and produced a score.
 
 ### The investment thesis
 
@@ -468,6 +657,43 @@ Consequences:
 - **Bounded tool loops** — each agent runs under a step cap and degrades to
   partial findings instead of running away.
 
+### Testing
+
+**317 tests, offline by construction.** The design bet pays off here: because
+detection, adjudication, confidence, gap-finding and groundedness are pure
+Python, the parts that decide things can be tested rather than trusted. The LLM's
+share is small enough to stub.
+
+Three principles the suite is built on:
+
+**Hermeticity is enforced, not assumed.** `conftest.py` scrubs model credentials
+for the whole session because the original failure was order-dependent — a test
+asserting "reaching a model raises" passed alone and failed after any test that
+imported the tools package and pulled real keys into the environment. The cost of
+that bug was never a red test; it was a full-suite run quietly spending money.
+The LangSmith variables are scrubbed for the identical reason one step over: a
+developer with tracing exported would otherwise ship traces of every stubbed run
+to a real project.
+
+**Assert on the real artifact, one layer below the UI.** The run-tree tests
+record LangChain's actual callback stream — the exact thing LangSmith renders
+into a trace — so "one root run, a child per node, one span per planning
+iteration" is asserted against genuine framework output rather than against a
+mock of our own code. Mock the network, not the framework.
+
+**A green suite proves your code matches your beliefs, not reality.** Two real
+bugs shipped past all 317 tests: LangSmith's refusal of a second run update
+(409), and the convergence mislabel above. Both were contract mismatches, and in
+both cases the test double happily agreed with the wrong assumption — a mock
+encodes a belief about a dependency, so when the belief is wrong the mock is
+wrong the same way, now with a passing test defending it.
+
+The remedy is one cheap real-contract check rather than more mocks: stubbed LLMs
+against live LangSmith costs nothing and exercises the boundary. It found both
+bugs in a single run. A partial double is worse than none, incidentally — the
+recording client initially lacked `create_run`, so the tracer silently fell back
+to a *real* client and the offline suite started making live calls.
+
 ---
 
 ## Project Structure
@@ -477,7 +703,8 @@ multi-agent-due-diligence/
 ├── README.md
 ├── CLAUDE.md                     # AI coding assistant instructions
 ├── requirements.txt
-├── .env                          # API keys (OPENAI_API_KEY, TAVILY_API_KEY)
+├── .env                          # Real keys — gitignored, never committed
+├── .env.example                  # Every variable the system reads, with placeholders
 ├── app.py                        # Streamlit frontend (dark fintech theme)
 ├── scripts/
 │   └── evaluate.py               # Offline judge run over saved report fixtures
@@ -485,6 +712,7 @@ multi-agent-due-diligence/
 │   ├── __init__.py
 │   ├── state.py                  # DueDiligenceState, Finding, AgentFindings, Conflict
 │   ├── llm.py                    # Tiered, cached LLM clients (FAST/REASONING/SYNTHESIS)
+│   ├── observability.py          # LangSmith tracing, per-tier cost, evaluator feedback
 │   ├── checkpointing.py          # Serializer allowlist for interrupt/resume state
 │   ├── graph.py                  # LangGraph StateGraph wiring + CLI entry point
 │   ├── planning/
@@ -546,7 +774,8 @@ multi-agent-due-diligence/
     ├── test_thesis.py            # Citation audit + validation (offline)
     ├── test_approval.py          # Human-in-the-loop interrupt/resume (offline)
     ├── test_checkpointing.py     # Serializer allowlist (offline)
-    └── test_eval.py              # Groundedness checks (offline)
+    ├── test_eval.py              # Groundedness checks (offline)
+    └── test_observability.py     # Run tree, tier metadata, feedback, fail-open (offline)
 ```
 
 The four research agents are configuration only — prompt, tools, and target
@@ -563,8 +792,11 @@ state key. All shared machinery lives in `agents/base.py`.
 | **Tavily (news topic)** | Sentiment Agent | `search_depth="advanced"` + `topic="news"` for recent articles |
 | **Tavily (reddit scope)** | Sentiment Agent | `include_domains=["reddit.com"]` for developer/user discussions |
 | **Tavily (sec.gov scope)** | Risk Agent | `include_domains=["sec.gov"]` for SEC EDGAR filings |
+| **LangSmith** | Whole pipeline | Optional tracing: per-tier cost/latency, run metadata, evaluator feedback scores |
 
 All tools return empty results on failure instead of raising exceptions, so the pipeline always completes.
+LangSmith follows the same rule one step further: it fails open *and* fails fast,
+so neither an outage nor an unreachable endpoint can fail or delay a run.
 
 ---
 
@@ -599,7 +831,12 @@ so the requested shape and the consumed shape cannot drift apart.
 ## Requirements
 
 See [`requirements.txt`](requirements.txt). Core stack: LangGraph 1.x,
-LangChain 1.x, Pydantic v2, Tavily, yfinance, Streamlit.
+LangChain 1.x, Pydantic v2, LangSmith, Tavily, yfinance, Streamlit.
+
+> **Note on `langsmith`:** it already arrives as a `langchain-core` dependency,
+> but is pinned explicitly because `src/observability.py` imports it directly —
+> an implicit transitive dependency is not a contract. It stays optional at
+> runtime regardless.
 
 > **Note on LangGraph 1.x:** agents are built with
 > `langchain.agents.create_agent(system_prompt=...)`. The older
