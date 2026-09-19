@@ -25,13 +25,6 @@ from src.state import Conflict, DueDiligenceState
 
 logger = logging.getLogger(__name__)
 
-FINDING_KEYS = [
-    "financial_findings",
-    "market_findings",
-    "risk_findings",
-    "sentiment_findings",
-]
-
 #: Qualitative claims handed to the tension pass, best evidence first.
 MAX_TENSION_CLAIMS = 40
 
@@ -54,26 +47,45 @@ def _to_conflict(contradiction: Contradiction) -> Conflict:
 
 
 async def evidence_node(state: DueDiligenceState) -> dict:
-    """LangGraph node: build the scored claim graph and derive conflicts."""
+    """LangGraph node: build the scored claim graph and derive conflicts.
+
+    Re-entrant. The refinement loop comes back here after each extra round of
+    research, so only findings blocks that have not been seen before are sent
+    for extraction — the expensive step. Detection and scoring then re-run over
+    the *whole* claim set, because a new claim can corroborate or contradict an
+    old one, and both of those change confidences already assigned.
+    """
     subject = state["company"].strip().lower()
 
-    findings = [state.get(key) for key in FINDING_KEYS]
-    extracted = await asyncio.gather(
-        *(extract_claims(f, subject) for f in findings),
-        return_exceptions=True,
-    )
+    # One block per dispatched research task. The planner decides how many,
+    # so this iterates what actually arrived rather than four fixed keys.
+    blocks = state.get("findings") or []
+    already_extracted = int(state.get("extracted_upto") or 0)
+    fresh = blocks[already_extracted:]
 
-    claims: list[Claim] = []
-    for key, result in zip(FINDING_KEYS, extracted):
-        if isinstance(result, BaseException):
-            logger.error("Claim extraction failed for %s: %s", key, result)
-            continue
-        claims.extend(result)
+    claims: list[Claim] = list(state.get("claims") or [])
+
+    if fresh:
+        extracted = await asyncio.gather(
+            *(extract_claims(block, subject) for block in fresh),
+            return_exceptions=True,
+        )
+        for block, result in zip(fresh, extracted):
+            if isinstance(result, BaseException):
+                logger.error(
+                    "Claim extraction failed for %s: %s",
+                    block.get("agent_name", "unknown"), result,
+                )
+                continue
+            claims.extend(result)
 
     if not claims:
         logger.warning("No claims extracted for %r", subject)
-        return {"claims": [], "conflicts": []}
+        return {"claims": [], "conflicts": [], "extracted_upto": len(blocks)}
 
+    # Rescored across everything, not just the new arrivals: corroboration and
+    # contradiction are relations between claims, so a single new claim can
+    # change the confidence of one gathered two rounds ago.
     detection = detect(claims)
     score_claims(claims, detection)
 
@@ -92,7 +104,11 @@ async def evidence_node(state: DueDiligenceState) -> dict:
 
     quantitative = sum(1 for c in claims if c.is_quantitative)
     logger.info(
-        "Evidence: %d claim(s) (%d quantitative), %d conflict(s)",
-        len(claims), quantitative, len(conflicts),
+        "Evidence: %d claim(s) (%d quantitative, %d new), %d conflict(s)",
+        len(claims), quantitative, len(fresh), len(conflicts),
     )
-    return {"claims": claims, "conflicts": conflicts}
+    return {
+        "claims": claims,
+        "conflicts": conflicts,
+        "extracted_upto": len(blocks),
+    }

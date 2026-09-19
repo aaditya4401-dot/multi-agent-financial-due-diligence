@@ -1,28 +1,38 @@
-"""Factory for research agent nodes.
+"""The research node: one task in, one findings block out.
 
-The four research agents (financial, market, risk, sentiment) differ only in
-their prompt, their tools, and the state key they write to. This factory holds
-the shared machinery so each agent module is just configuration.
+There used to be four nodes, each built at import time around a fixed toolset.
+The planner decides toolsets per run, so there is now a single node that
+executes whichever :class:`ResearchTask` it is handed, and the graph invokes it
+once per task via ``Send``.
 
-Two things the old per-agent code got wrong and this fixes:
+Three things worth knowing about this node:
 
-* The agent graph was rebuilt on every invocation. It is now built once,
-  lazily, and reused.
-* Tool loops were unbounded. Each agent now runs under a step cap, and hitting
-  that cap degrades to partial findings instead of raising.
+* **Its input is the Send payload, not graph state.** LangGraph passes a
+  ``Send`` payload as the node's entire input — ``state["company"]`` is not
+  readable here. Everything a task needs must travel in the payload.
+* **It writes to a reducer-backed list.** Two parallel writes to a single state
+  key raise ``InvalidUpdateError``, so tasks append to ``findings`` rather than
+  owning a key each. That is what allows two tasks aimed at the same agent.
+* **It never raises.** A failed agent returns ``ok=False`` findings so the
+  synthesizer can report that section as unknown, rather than taking the whole
+  pipeline down with it.
+
+Compiled agents are cached per (agent, toolset). Caching on the agent alone
+would return an agent built with the previous run's tools.
 """
 
 import logging
 import os
-from collections.abc import Callable, Sequence
 from typing import Any
 
 from langchain.agents import create_agent
 from langgraph.errors import GraphRecursionError
 
+from src.agents.registry import AGENT_SPECS
 from src.agents.utils import error_findings, parse_react_output
-from src.llm import Tier, get_llm
-from src.state import DueDiligenceState
+from src.llm import get_llm
+from src.observability import annotate_current_run
+from src.planning.models import ResearchTask
 
 logger = logging.getLogger(__name__)
 
@@ -30,71 +40,100 @@ logger = logging.getLogger(__name__)
 # tool call (model turn + tool turn), so this is ~10 tool calls.
 DEFAULT_MAX_STEPS = int(os.getenv("DD_AGENT_MAX_STEPS", "20"))
 
+#: (agent name, tool names) → compiled agent.
+_COMPILED: dict[tuple[str, tuple[str, ...]], Any] = {}
 
-def make_research_agent(
-    *,
-    name: str,
-    state_key: str,
-    system_prompt: str,
-    tools: Sequence[Any],
-    task_prompt: str,
-    tier: Tier = Tier.REASONING,
-    max_steps: int = DEFAULT_MAX_STEPS,
-) -> Callable:
-    """Build a LangGraph node that runs one research agent.
+
+def _as_task(raw: Any) -> ResearchTask:
+    """Accept a ResearchTask or its serialised form.
+
+    A checkpointer round-trips state through JSON, so a resumed run hands this
+    node a plain dict where a fresh run hands it a model.
+    """
+    if isinstance(raw, ResearchTask):
+        return raw
+    if isinstance(raw, dict):
+        return ResearchTask(**raw)
+    raise TypeError(f"cannot interpret {type(raw).__name__} as a ResearchTask")
+
+
+def _compiled_agent(agent_name: str, tools: list[Any], system_prompt: str, tier) -> Any:
+    key = (agent_name, tuple(sorted(t.name for t in tools)))
+    if key not in _COMPILED:
+        _COMPILED[key] = create_agent(
+            model=get_llm(tier),
+            tools=tools,
+            system_prompt=system_prompt,
+        )
+    return _COMPILED[key]
+
+
+async def research_node(payload: dict) -> dict:
+    """LangGraph node: run one research task and append its findings.
 
     Args:
-        name: Agent name, used in findings and logs (e.g. ``"financial"``).
-        state_key: State field the node writes to (e.g. ``"financial_findings"``).
-        system_prompt: The agent's persona and standing instructions.
-        tools: Tools available to this agent.
-        task_prompt: The task, containing a ``{company}`` placeholder.
-        tier: Which model tier to run on.
-        max_steps: Recursion limit for the agent's tool loop.
+        payload: The ``Send`` payload — ``{"company": str, "task": ResearchTask}``.
+            This is the node's whole input; graph state is not visible.
 
     Returns:
-        An async callable suitable for ``workflow.add_node``.
+        ``{"findings": [AgentFindings]}``, appended by the state reducer.
     """
-    compiled: list[Any] = []  # single-slot lazy cache
+    company = payload["company"]
+    task = _as_task(payload["task"])
+    max_steps = int(payload.get("max_steps") or DEFAULT_MAX_STEPS)
 
-    def _agent():
-        if not compiled:
-            compiled.append(
-                create_agent(
-                    model=get_llm(tier),
-                    tools=list(tools),
-                    system_prompt=system_prompt,
-                )
-            )
-        return compiled[0]
+    spec = AGENT_SPECS.get(task.agent)
+    if spec is None:
+        logger.error("Plan named unknown agent %r — skipping", task.agent)
+        return {"findings": [
+            error_findings(task.agent, ValueError(f"unknown agent {task.agent!r}"))
+        ]}
 
-    async def node(state: DueDiligenceState) -> dict:
-        company = state["company"]
+    tools = spec.resolve_tools(task.tools)
+    logger.info(
+        "%s agent researching %r with %s",
+        spec.name, company, [t.name for t in tools],
+    )
 
-        try:
-            result = await _agent().ainvoke(
-                {"messages": [{"role": "user", "content": task_prompt.format(company=company)}]},
-                config={"recursion_limit": max_steps},
-            )
-            findings = parse_react_output(name, result)
+    # Name the span after the agent. Research tasks fan out via Send, so a
+    # round produces several concurrent runs of this one node — all called
+    # "research" and otherwise impossible to tell apart in a trace. `focus` is
+    # what distinguishes a refinement task from the original broad survey.
+    annotate_current_run(
+        name=f"agent:{spec.name}",
+        **{
+            "dd.agent": spec.name,
+            "dd.routing_tier": spec.tier.value,
+            "dd.tools": [t.name for t in tools],
+            "dd.is_refinement": bool(task.focus),
+        },
+    )
 
-        except GraphRecursionError:
-            # The agent ran out of steps. Whatever it gathered is lost, but
-            # this is a budget problem, not a failure of the pipeline.
-            logger.warning(
-                "%s agent hit the %d-step cap for %r — returning no findings",
-                name, max_steps, company,
-            )
-            findings = error_findings(
-                name, RuntimeError(f"exceeded {max_steps}-step budget")
-            )
+    try:
+        agent = _compiled_agent(spec.name, tools, spec.system_prompt, spec.tier)
+        result = await agent.ainvoke(
+            {"messages": [
+                {"role": "user", "content": spec.compose_task(company, task.focus)}
+            ]},
+            config={"recursion_limit": max_steps},
+        )
+        findings = parse_react_output(spec.name, result)
 
-        except Exception as exc:
-            logger.exception("%s agent failed for %r", name, company)
-            findings = error_findings(name, exc)
+    except GraphRecursionError:
+        # The agent ran out of steps. Whatever it gathered is lost, but this is
+        # a budget problem, not a failure of the pipeline.
+        logger.warning(
+            "%s agent hit the %d-step cap for %r — returning no findings",
+            spec.name, max_steps, company,
+        )
+        findings = error_findings(
+            spec.name, RuntimeError(f"exceeded {max_steps}-step budget")
+        )
 
-        return {state_key: findings}
+    except Exception as exc:
+        logger.exception("%s agent failed for %r", spec.name, company)
+        findings = error_findings(spec.name, exc)
 
-    node.__name__ = f"{name}_agent"
-    node.__doc__ = f"LangGraph node: run the {name} research agent."
-    return node
+    if task.caveat:
+        findings["caveat"] = task.caveat
+    return {"findings": [findings]}

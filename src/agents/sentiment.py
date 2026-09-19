@@ -2,7 +2,7 @@ import json
 
 from langchain_core.tools import tool
 
-from src.agents.base import make_research_agent
+from src.agents.spec import AgentSpec
 from src.tools.news_tools import search_news, search_reddit_sentiment
 from src.tools.search_tools import asearch_web
 
@@ -42,10 +42,9 @@ async def tool_search_sentiment(query: str) -> str:
 
 TOOLS = [tool_search_news, tool_search_reddit, tool_search_sentiment]
 
-sentiment_agent = make_research_agent(
+SPEC = AgentSpec(
     name="sentiment",
-    state_key="sentiment_findings",
     system_prompt=SYSTEM_PROMPT,
-    tools=TOOLS,
     task_prompt=TASK_PROMPT,
+    tools=tuple(TOOLS),
 )

@@ -15,12 +15,16 @@ from src.claims.ontology import Predicate, Unit
 from src.agents.conflict_resolver import detect_tensions
 from src.agents.evidence import evidence_node
 from src.agents.synthesizer import (
+    agent_status,
     failed_agents,
     section_confidences,
     synthesizer_node,
 )
+import src.agents.base as base
 from src.agents.utils import error_findings, parse_react_output
-from src.graph import app
+from src.graph import app, dispatch_research
+from src.planning.models import ResearchTask
+from src.planning.plan import plan_for
 from src.models.schemas import DueDiligenceReport, inconclusive_report
 from src.state import AgentFindings, Finding
 
@@ -141,14 +145,35 @@ class TestFailureSemantics:
         assert parsed["ok"] is True
 
     def test_failed_agents_detected(self):
+        """An agent that errored and one that produced nothing both count as
+        failed, so long as the plan asked for them."""
         state = {
             "company": "TestCo",
-            "financial_findings": _findings("financial"),
-            "market_findings": _findings("market", ok=False),
-            "risk_findings": None,
-            "sentiment_findings": _findings("sentiment"),
+            "findings": [
+                _findings("financial"),
+                _findings("market", ok=False),
+                # risk produced nothing at all
+                _findings("sentiment"),
+            ],
         }
         assert failed_agents(state) == ["market", "risk"]
+
+    def test_skipped_is_not_failed(self):
+        """A section the plan never asked for is not an evidence gap.
+
+        Counting it as a failure would make the system score itself down for
+        following its own plan.
+        """
+        plan = plan_for("TestCo")
+        plan.tasks = [t for t in plan.tasks if t.agent != "sentiment"]
+        state = {
+            "company": "TestCo",
+            "plan": plan,
+            "findings": [_findings(a) for a in ("financial", "market", "risk")],
+        }
+        failed, skipped = agent_status(state)
+        assert skipped == ["sentiment"]
+        assert failed == [], "nothing failed — one section was simply not requested"
 
     def test_inconclusive_is_not_unfavorable(self):
         r = inconclusive_report("TestCo", "2026-08-14", "everything failed")
@@ -163,8 +188,8 @@ class TestFailureSemantics:
         state = {
             "company": "TestCo",
             "conflicts": [],
-            **{f"{a}_findings": _findings(a, ok=False)
-               for a in ("financial", "market", "risk", "sentiment")},
+            "findings": [_findings(a, ok=False)
+                         for a in ("financial", "market", "risk", "sentiment")],
         }
         result = asyncio.run(synthesizer_node(state))
         report = result["final_report"]
@@ -173,6 +198,34 @@ class TestFailureSemantics:
         assert sorted(report["unavailable_sections"]) == [
             "financial", "market", "risk", "sentiment"
         ]
+
+    def test_cancelled_run_is_not_reported_as_a_failure(self):
+        """A reviewer cancelling and every agent crashing both end with no
+        findings, but calling the first one a failure is a false statement
+        about the system's own behaviour.
+
+        Found by driving the Streamlit gate, not by a unit test — the empty
+        plan only arises through the approval path.
+        """
+        cancelled = plan_for("TestCo").model_copy(update={"tasks": []})
+        state = {"company": "TestCo", "conflicts": [], "findings": [],
+                 "plan": cancelled}
+
+        report = asyncio.run(synthesizer_node(state))["final_report"]
+        summary = report["executive_summary"]
+        assert "no research was run" in summary
+        assert "failed" not in summary
+        assert report["overall_verdict"] == "Inconclusive"
+
+    def test_genuine_total_failure_still_says_failed(self):
+        """The other side of the same coin — don't soften a real failure."""
+        state = {
+            "company": "TestCo", "conflicts": [],
+            "findings": [_findings(a, ok=False)
+                         for a in ("financial", "market", "risk", "sentiment")],
+        }
+        report = asyncio.run(synthesizer_node(state))["final_report"]
+        assert "failed" in report["executive_summary"]
 
     def test_report_dump_matches_schema(self):
         r = inconclusive_report("TestCo", "2026-08-14", "reason")
@@ -190,10 +243,12 @@ class TestEvidenceNode:
     def test_no_findings_yields_no_claims_or_conflicts(self):
         state = {
             "company": "TestCo",
-            **{f"{a}_findings": _findings(a, ok=False)
-               for a in ("financial", "market", "risk", "sentiment")},
+            "findings": [_findings(a, ok=False)
+                         for a in ("financial", "market", "risk", "sentiment")],
         }
-        assert asyncio.run(evidence_node(state)) == {"claims": [], "conflicts": []}
+        assert asyncio.run(evidence_node(state)) == {
+            "claims": [], "conflicts": [], "extracted_upto": 4,
+        }
 
     def test_tension_detection_skipped_below_two_claims(self):
         assert asyncio.run(detect_tensions("testco", [])) == []
@@ -253,6 +308,9 @@ class TestImportHygiene:
         "src.claims.extract",
         "src.claims.models",
         "src.graph",
+        "src.planning.plan",
+        "src.planning.classify",
+        "src.agents.registry",
         "src.agents.evidence",
         "src.agents.synthesizer",
     ])
@@ -267,17 +325,122 @@ class TestImportHygiene:
         assert result.returncode == 0, f"{module} failed to import:\n{result.stderr}"
 
 
+class TestResearchNode:
+    """The node dispatched by Send. Its input is the payload, not graph state."""
+
+    def _fake_agent(self, monkeypatch, recorder=None):
+        class FakeAgent:
+            def __init__(self, tools): self.tools = tools
+            async def ainvoke(self, payload, config=None):
+                if recorder is not None:
+                    recorder["tools"] = [t.name for t in self.tools]
+                    recorder["prompt"] = payload["messages"][0]["content"]
+                class M:
+                    type, content, tool_calls = "ai", "stub summary", []
+                return {"messages": [M()]}
+        monkeypatch.setattr(
+            base, "_compiled_agent", lambda name, tools, sp, tier: FakeAgent(tools))
+
+    def test_appends_one_findings_block(self, monkeypatch):
+        self._fake_agent(monkeypatch)
+        out = asyncio.run(base.research_node(
+            {"company": "TestCo", "task": ResearchTask(agent="market")}))
+        assert list(out) == ["findings"]
+        assert len(out["findings"]) == 1
+        assert out["findings"][0]["agent_name"] == "market"
+
+    def test_planner_narrows_the_toolset(self, monkeypatch):
+        """The whole point of the phase: tools are a runtime decision."""
+        rec = {}
+        self._fake_agent(monkeypatch, rec)
+        asyncio.run(base.research_node({
+            "company": "TestCo",
+            "task": ResearchTask(agent="financial", tools=["tool_search_web"]),
+        }))
+        assert rec["tools"] == ["tool_search_web"]
+
+    def test_focus_is_appended_to_the_task_prompt(self, monkeypatch):
+        rec = {}
+        self._fake_agent(monkeypatch, rec)
+        asyncio.run(base.research_node({
+            "company": "TestCo",
+            "task": ResearchTask(agent="risk", focus="Look at enforcement actions."),
+        }))
+        assert "TestCo" in rec["prompt"]
+        assert "Look at enforcement actions." in rec["prompt"]
+
+    def test_caveat_travels_into_the_findings(self, monkeypatch):
+        """It has to reach the synthesizer, which is what honours it in prose."""
+        self._fake_agent(monkeypatch)
+        out = asyncio.run(base.research_node({
+            "company": "TestCo",
+            "task": ResearchTask(agent="financial", caveat="Estimates only."),
+        }))
+        assert out["findings"][0]["caveat"] == "Estimates only."
+
+    def test_serialised_task_is_accepted(self, monkeypatch):
+        """A checkpointer round-trips state through JSON, so a resumed run
+        hands this node a dict where a fresh run hands it a model."""
+        self._fake_agent(monkeypatch)
+        out = asyncio.run(base.research_node(
+            {"company": "TestCo", "task": ResearchTask(agent="market").model_dump()}))
+        assert out["findings"][0]["agent_name"] == "market"
+
+    def test_unknown_agent_degrades_instead_of_raising(self):
+        """CLAUDE.md: never crash the pipeline."""
+        out = asyncio.run(base.research_node(
+            {"company": "TestCo", "task": ResearchTask(agent="astrology")}))
+        assert out["findings"][0]["ok"] is False
+
+
 class TestGraphTopology:
     def test_all_nodes_present(self):
         nodes = set(app.get_graph().nodes)
-        assert {
-            "orchestrator", "financial", "market", "risk",
-            "sentiment", "evidence", "synthesizer",
-        } <= nodes
+        assert {"planner", "research", "evidence", "synthesizer"} <= nodes
 
-    def test_agents_fan_out_and_back_in(self):
+    def test_research_fan_out_is_conditional(self):
+        """The planner must *choose*. A plain edge here would mean the fan-out
+        is constant again, which is the thing this phase removed."""
+        edges = {(e.source, e.target): e for e in app.get_graph().edges}
+        assert edges[("approval", "research")].conditional
+        # The gate sits between planning and any spending.
+        assert ("planner", "approval") in edges
+
+    def test_fan_in_is_a_single_edge(self):
+        """One edge, so it fires once for any number of dispatched tasks.
+
+        The old join edge named all four agents and could never have tolerated
+        a variable-width fan-out.
+        """
         edges = {(e.source, e.target) for e in app.get_graph().edges}
-        for agent in ("financial", "market", "risk", "sentiment"):
-            assert ("orchestrator", agent) in edges
-            assert (agent, "evidence") in edges
-        assert ("evidence", "synthesizer") in edges
+        assert ("research", "evidence") in edges
+        assert ("evidence", "gap_analyzer") in edges
+
+    def test_empty_plan_routes_past_research(self):
+        """Reachable once a human can deselect every agent at an approval gate.
+
+        Without this the graph would stall instead of reporting inconclusive.
+        """
+        assert dispatch_research({"plan": plan_for("TestCo").model_copy(
+            update={"tasks": []})}) == "thesis"
+
+    def test_graph_is_cyclic(self):
+        """gap_analyzer must be able to send work back to research.
+
+        Without this edge the graph is a line again and the synthesizer can
+        only write up whatever the first pass happened to find.
+        """
+        edges = {(e.source, e.target) for e in app.get_graph().edges}
+        assert ("gap_analyzer", "research") in edges
+        assert ("gap_analyzer", "thesis") in edges
+        assert ("thesis", "synthesizer") in edges
+
+    def test_dispatch_emits_one_send_per_task(self):
+        plan = plan_for("TestCo")
+        sends = dispatch_research({"plan": plan})
+        assert len(sends) == len(plan.tasks)
+        assert {s.node for s in sends} == {"research"}
+        # Payload must be self-contained: a Send'd node cannot read graph state.
+        for send in sends:
+            assert send.arg["company"] == "TestCo"
+            assert send.arg["task"] in plan.tasks

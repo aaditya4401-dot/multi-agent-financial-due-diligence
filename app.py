@@ -1,33 +1,59 @@
 import asyncio
 import logging
+import os
+
 import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from src.graph import run  # noqa: E402 (after load_dotenv)
+from src.graph import pending_review, resume, run  # noqa: E402 (after load_dotenv)
 
 logger = logging.getLogger(__name__)
 
+#: Human review pauses the graph mid-run, and Streamlit reruns its whole script
+#: on every interaction — so the paused state has to outlive the process's
+#: memory. An interrupt is a checkpoint, and this is where checkpoints go.
+CHECKPOINT_PATH = os.getenv("DD_CHECKPOINT_PATH", ".dd_checkpoints.sqlite")
 
-def run_sync(company: str, timeout: int = 120) -> dict:
-    """Run the async pipeline from sync Streamlit context with a timeout."""
+
+def _await(make_coro, timeout: int = 180):
+    """Run one async call from Streamlit's synchronous context."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
 
-    async def _run_with_timeout():
-        return await asyncio.wait_for(run(company), timeout=timeout)
+    async def _go():
+        return await asyncio.wait_for(make_coro(), timeout=timeout)
 
     if loop and loop.is_running():
-        # Streamlit is already running an event loop — use a new thread
+        # Streamlit is already running an event loop — use a new thread.
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            future = pool.submit(asyncio.run, _run_with_timeout())
-            return future.result(timeout=timeout + 10)
-    else:
-        return asyncio.run(_run_with_timeout())
+            return pool.submit(asyncio.run, _go()).result(timeout=timeout + 10)
+    return asyncio.run(_go())
+
+
+def run_sync(company: str, human_review: bool = False, timeout: int = 180) -> dict:
+    """Start a run. With review on, this returns a *paused* state."""
+    return _await(
+        lambda: run(
+            company,
+            human_review=human_review,
+            checkpoint_path=CHECKPOINT_PATH if human_review else None,
+        ),
+        timeout,
+    )
+
+
+def resume_sync(decision: dict, thread_id: str, timeout: int = 180) -> dict:
+    """Continue a paused run with the reviewer's decision."""
+    return _await(
+        lambda: resume(decision, thread_id, checkpoint_path=CHECKPOINT_PATH),
+        timeout,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -411,10 +437,91 @@ company = col_input.text_input("Company name", placeholder="Enter company name (
                                label_visibility="collapsed")
 run_clicked = col_btn.button("Run Analysis", type="primary", use_container_width=True)
 
-if run_clicked and company.strip():
-    with st.spinner(f"Agents analyzing {company}..."):
-        state = run_sync(company.strip(), timeout=120)
+review_first = st.checkbox(
+    "Review the research plan before running",
+    help="Pause after planning so you can approve, trim, or cancel the work "
+         "before any agent spends money.",
+)
 
+# Streamlit reruns this script top to bottom on every click, so a run that is
+# paused mid-graph has to be remembered explicitly.
+st.session_state.setdefault("dd_state", None)
+st.session_state.setdefault("dd_thread", None)
+st.session_state.setdefault("dd_pending", None)
+
+
+def _store(state: dict) -> None:
+    st.session_state.dd_state = state
+    st.session_state.dd_thread = state.get("__thread_id__")
+    st.session_state.dd_pending = pending_review(state)
+
+
+if run_clicked and company.strip():
+    st.session_state.dd_state = None
+    st.session_state.dd_pending = None
+    label = "Planning..." if review_first else f"Agents analyzing {company}..."
+    with st.spinner(label):
+        _store(run_sync(company.strip(), human_review=review_first))
+elif run_clicked:
+    st.warning("Please enter a company name.")
+
+
+# ---------------------------------------------------------------------------
+# Approval gate — shown only while the graph is paused
+# ---------------------------------------------------------------------------
+
+pending = st.session_state.dd_pending
+if pending:
+    st.markdown("### Research plan awaiting approval")
+    st.info(pending.get("question", "Approve this plan?"))
+
+    kind = pending.get("company_type", "unknown")
+    ticker = pending.get("ticker")
+    st.markdown(f"**Classified:** {kind}{f' ({ticker})' if ticker else ''}")
+    st.caption(pending.get("rationale", ""))
+
+    tasks = pending.get("tasks", [])
+    for task in tasks:
+        st.markdown(f"**{task['agent']}** — {', '.join(task['tools']) or 'all tools'}")
+        if task.get("caveat"):
+            st.caption(task["caveat"])
+
+    drop = st.multiselect(
+        "Skip these agents",
+        [t["agent"] for t in tasks],
+        help="A skipped agent is reported as not researched, not as a failure.",
+    )
+    note = st.text_input("Note (kept in the audit trail)", "")
+
+    approve_col, cancel_col = st.columns([1, 1])
+    if approve_col.button(
+        "Run this plan" if not drop else f"Run without {', '.join(drop)}",
+        type="primary", use_container_width=True,
+    ):
+        decision = {
+            "action": "revise" if drop else "approve",
+            "drop_agents": drop,
+            "note": note,
+        }
+        with st.spinner("Agents working..."):
+            _store(resume_sync(decision, st.session_state.dd_thread))
+        st.rerun()
+
+    if cancel_col.button("Cancel run", use_container_width=True):
+        with st.spinner("Cancelling..."):
+            _store(resume_sync(
+                {"action": "cancel", "note": note}, st.session_state.dd_thread))
+        st.rerun()
+
+    st.stop()
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+state = st.session_state.dd_state
+if state is not None:
     report: dict = state.get("final_report", {})
 
     if not report:
@@ -432,6 +539,29 @@ if run_clicked and company.strip():
             f"{'agent' if len(unavailable) == 1 else 'agents'} failed. "
             "Those sections are unknown, not clean."
         )
+
+    # A skipped section is not a failure and must not be shown as one: the
+    # planner chose not to research it, so nothing we wanted is missing.
+    skipped = report.get("skipped_sections", [])
+    if skipped:
+        st.info(
+            f"Not researched — {', '.join(skipped)}. "
+            "Left out of the research plan for this company, not a failure."
+        )
+
+    plan = state.get("plan")
+    if plan is not None:
+        kind = getattr(plan.company_type, "value", str(plan.company_type))
+        label = f"Research plan — {kind}"
+        if plan.ticker:
+            label += f" ({plan.ticker})"
+        with st.expander(label):
+            st.markdown(plan.rationale)
+            for task in plan.tasks:
+                tools = ", ".join(task.tools) or "all available"
+                st.markdown(f"**{task.agent}** — {tools}")
+                if task.caveat:
+                    st.caption(task.caveat)
 
     # ---- Metric cards ----
     st.markdown("")
@@ -452,6 +582,62 @@ if run_clicked and company.strip():
     st.markdown(f'<div style="color:#C8CAD4;font-size:0.9rem;line-height:1.7;">'
                 f'{report.get("executive_summary", "No summary available.")}</div>',
                 unsafe_allow_html=True)
+
+    # ---- Investment thesis ----
+    thesis = report.get("thesis")
+    if thesis:
+        st.markdown("")
+        st.markdown("### Investment Thesis")
+
+        rec = thesis.get("recommendation", "Insufficient evidence")
+        st.markdown(f"**{rec}** — {thesis.get('summary', '')}")
+        if thesis.get("recommendation_rationale"):
+            st.caption(thesis["recommendation_rationale"])
+
+        drivers = thesis.get("drivers", [])
+        if drivers:
+            st.markdown("**Drivers**")
+            for d in drivers:
+                arrow = "▲" if d.get("direction") == "supports" else "▼"
+                st.markdown(
+                    f"{arrow} {d['statement']}  \n"
+                    f'<span style="color:#555A6E;font-size:0.82rem;">'
+                    f"Falsified if: {d.get('what_would_falsify_this', 'n/a')} "
+                    f"&nbsp;·&nbsp; {len(d.get('evidence_claim_ids', []))} sourced claim(s) "
+                    f"&nbsp;·&nbsp; confidence {d.get('confidence', 0):.0%}</span>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info(
+                "No thesis driver could be traced to a sourced claim, so no "
+                "recommendation is supportable."
+            )
+
+        cases = [("Bull", "bull_case"), ("Base", "base_case"), ("Bear", "bear_case")]
+        cols = st.columns(3)
+        for (label, key), col in zip(cases, cols):
+            case = thesis.get(key) or {}
+            col.markdown(f"**{label} case**")
+            col.caption(case.get("narrative", "Not established."))
+
+        # Deal breakers are graded separately from ordinary risks on purpose.
+        breakers = [f for f in thesis.get("red_flags", [])
+                    if f.get("severity") == "deal_breaker"]
+        others = [f for f in thesis.get("red_flags", [])
+                  if f.get("severity") != "deal_breaker"]
+        if breakers:
+            st.error("**Deal breakers** — " + "; ".join(f["issue"] for f in breakers))
+        if others:
+            st.markdown("**Other flags**")
+            for flag in others:
+                st.markdown(f"- _{flag.get('severity', 'monitor')}_ — {flag['issue']}")
+
+        # Generated by the gap analyzer, not invented by the model.
+        questions = thesis.get("open_questions", [])
+        if questions:
+            with st.expander(f"Open diligence items ({len(questions)})"):
+                for q in questions:
+                    st.markdown(f"- {q}")
 
     # ---- Section findings ----
     st.markdown("")
@@ -480,6 +666,3 @@ if run_clicked and company.strip():
     st.markdown("")
     st.markdown("### Conflicts Detected")
     render_conflicts(report.get("conflicts_detected", []))
-
-elif run_clicked:
-    st.warning("Please enter a company name.")

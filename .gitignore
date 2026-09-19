@@ -3,6 +3,8 @@ INTERVIEW_PREP.md
 
 # Environment
 .env
+.env.backup*
+.env.local
 .venv/
 venv/
 __pycache__/
